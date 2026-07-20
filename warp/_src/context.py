@@ -3858,6 +3858,12 @@ class Device:
             if warp.config.enable_mempools_at_init:
                 # enable if supported
                 self.is_mempool_enabled = self.is_mempool_supported
+            elif self.is_hip and self.is_mempool_supported:
+                # HIP/ROCm: enable mempool by default when graph capture is supported
+                # (hipGraph requires mempool for in-capture allocations).
+                # Previously disabled due to hipMemsetAsync unreliability, but
+                # graph capture is now validated on ROCm 7.2 (Warp PR #15).
+                self.is_mempool_enabled = True
             else:
                 # disable by default
                 self.is_mempool_enabled = False
