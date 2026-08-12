@@ -798,7 +798,12 @@ CUresult cuCtxEnablePeerAccess_f(CUcontext peer_ctx, unsigned int flags)
 #if defined(__HIP_PLATFORM_AMD__)
     if (!peer_ctx)
         return CUDA_ERROR_NOT_INITIALIZED;
-    return hipDeviceEnablePeerAccess(peer_ctx->device, flags);
+    hipError_t status = hipDeviceEnablePeerAccess(peer_ctx->device, flags);
+    // hipDeviceEnablePeerAccess is a runtime API that sets the sticky last-error state (e.g.
+    // hipErrorPeerAccessAlreadyEnabled/704). Clear it so a benign status does not leak into an
+    // unrelated runtime call (such as a subsequent hipcub call) and get reported there.
+    ignore_cuda_error(hipGetLastError());
+    return status;
 #else
     return pfn_cuCtxEnablePeerAccess ? pfn_cuCtxEnablePeerAccess(peer_ctx, flags) : DRIVER_ENTRY_POINT_ERROR;
 #endif  // defined(__HIP_PLATFORM_AMD__)

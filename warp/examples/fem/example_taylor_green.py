@@ -557,7 +557,12 @@ class Example:
         # reduced launch overhead.  Before each replay, step() computes
         # the time-dependent BC contributions into the working buffers
         # (_u_bd_rhs_buf, _p_rhs) that the graph references.
-        self.use_cuda_graph = wp.get_device().is_cuda
+        # NOTE: on HIP/ROCm 7.2, instantiating the large, mempool-allocation-heavy
+        # graph this step produces crashes inside hipGraphInstantiate (heap
+        # corruption in libamdhip64). Capture itself succeeds, so the graph-is-None
+        # check below does not catch it; skip capture up front and run eagerly.
+        device = wp.get_device()
+        self.use_cuda_graph = device.is_cuda and not device.is_hip
         if self.use_cuda_graph:
             import gc  # noqa: PLC0415
 
@@ -569,7 +574,7 @@ class Example:
             finally:
                 gc.enable()
             if self.graph is None:
-                self.use_cuda_graph = False  # Graph capture is disabled on HIP.
+                self.use_cuda_graph = False
 
     def _compute_bc(self, t):
         """Compute time-dependent Dirichlet BC contributions at time ``t``.

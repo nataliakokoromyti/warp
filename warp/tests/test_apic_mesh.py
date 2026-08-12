@@ -563,9 +563,11 @@ class TestApicMesh(unittest.TestCase):
     pass
 
 
-# APIC capture/save/load requires native graph capture, which is not yet
-# supported on HIP/ROCm (see Device.supports_graph_capture).
-devices = get_graph_capture_test_devices()
+# APIC capture/save/load requires native graph capture (see
+# Device.supports_graph_capture). The .wrp serialization format does not yet
+# support HIP gfx architectures, so HIP/ROCm devices are excluded here (see
+# capture_save()).
+devices = [d for d in get_graph_capture_test_devices() if not d.is_hip]
 
 add_function_test(TestApicMesh, "test_apic_mesh_query_point", test_apic_mesh_query_point, devices=devices)
 add_function_test(TestApicMesh, "test_apic_mesh_query_ray", test_apic_mesh_query_ray, devices=devices)

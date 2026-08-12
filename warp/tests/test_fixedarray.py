@@ -157,12 +157,9 @@ def test_capture_if_kernel():
 
 
 def test_capture_if(test, device):
-    if (
-        not wp.get_device(device).is_cuda
-        or not wp.get_device(device).supports_graph_capture
-        or wp._src.context.runtime.toolkit_version < (12, 4)
-        or wp._src.context.runtime.driver_version < (12, 4)
-    ):
+    # Conditional graph nodes require CUDA 12.4+ toolkit/driver and are not
+    # supported on HIP/ROCm; is_conditional_graph_supported() covers all cases.
+    if not wp.get_device(device).is_cuda or not wp.is_conditional_graph_supported():
         return
 
     def foo():

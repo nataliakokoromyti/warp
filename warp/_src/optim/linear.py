@@ -1112,8 +1112,22 @@ def _run_capturable_loop(
         if callback_launch is not None:
             callback_launch.launch()
 
+    def fixed_count_loop():
+        # Fallback that avoids conditional graph nodes: run a fixed number of
+        # cycles. The CG/CR update kernels zero out alpha/beta once the residual
+        # drops below tolerance (see _cg_kernel_1/_cg_kernel_2), so iterating past
+        # convergence is a no-op and the result is unchanged. When invoked inside an
+        # outer capture, these launches are recorded into that graph.
+        for _ in range(0, maxiter, cycle_size):
+            do_cycle_with_condition()
+
     if use_cuda_graph and device.is_cuda:
-        if device.is_capturing:
+        if not wp.is_conditional_graph_supported():
+            # Conditional graph nodes are unavailable (e.g. HIP/ROCm). Use a
+            # fixed-count loop instead of wp.capture_while so the solver still runs
+            # (and stays capturable) without requiring if/while subgraph support.
+            fixed_count_loop()
+        elif device.is_capturing:
             wp.capture_while(condition, do_cycle_with_condition)
         else:
             with wp.ScopedCapture() as capture:
@@ -1121,12 +1135,10 @@ def _run_capturable_loop(
             if capture.graph is not None:
                 wp.capture_launch(capture.graph)
             else:
-                # Graph capture not supported (e.g. HIP), fall back to eager loop
-                for _ in range(0, maxiter, cycle_size):
-                    do_cycle_with_condition()
+                # Graph capture not supported, fall back to eager loop
+                fixed_count_loop()
     else:
-        for _ in range(0, maxiter, cycle_size):
-            do_cycle_with_condition()
+        fixed_count_loop()
 
     return cur_iter, r_norm_sq, atol_sq
 

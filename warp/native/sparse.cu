@@ -7,6 +7,7 @@
 #include "temp_buffer.h"
 
 #include <cstdint>
+#include <unordered_map>
 
 #define THRUST_IGNORE_CUB_VERSION_CHECK
 
@@ -23,6 +24,41 @@ namespace cub = hipcub;
 extern CUcontext get_current_context();
 
 namespace {
+
+// Persistent per-stream scratch for CUB device algorithms (sort/RLE/scan) used
+// while building BSR matrices. Allocating CUB temp storage on the fly through a
+// graph-captured mempool allocation causes GPU memory faults on replay on
+// non-default HIP devices (peer-mapped pool memory reallocated inside the graph
+// is not reliably accessible during replay). Reusing a persistent buffer that
+// was sized during warmup avoids any allocation inside the capture, mirroring
+// the approach already used for radix sort (see g_radix_sort_temp_map).
+struct BsrCubTemp {
+    void* mem = nullptr;
+    size_t size = 0;
+};
+
+// Keyed by (stream, slot). Distinct slots are needed for buffers that must be
+// live simultaneously (e.g. CUB temp storage and the sort key/value buffers).
+static std::unordered_map<void*, std::unordered_map<int, BsrCubTemp>> g_bsr_scratch_map;
+
+static void* bsr_reserve_scratch(void* context, int slot, size_t size)
+{
+    void* stream = wp_cuda_stream_get_current();
+    BsrCubTemp& temp = g_bsr_scratch_map[stream][slot];
+    if (size > temp.size) {
+        // Only grows outside of capture (warmup); during capture the buffer is
+        // already large enough and is reused without a new allocation.
+        wp_free_device(context, temp.mem);
+        temp.mem = wp_alloc_device(context, size, "(native:sparse)");
+        temp.size = size;
+    }
+    return temp.mem;
+}
+
+static void* bsr_reserve_cub_temp(void* context, size_t size)
+{
+    return bsr_reserve_scratch(context, 0, size);
+}
 
 // Combined row+column value that can be radix-sorted with CUB
 using BsrRowCol = uint64_t;
@@ -273,19 +309,26 @@ WP_API void wp_bsr_matrix_from_triplets_device(
 
     cudaStream_t stream = static_cast<cudaStream_t>(wp_cuda_stream_get_current());
 
-    ScopedTemporary<BsrRowCol> combined_row_col(context, 2 * size_t(nnz));
-    ScopedTemporary<int> unique_triplet_count(context, 1);
+    BsrRowCol* combined_row_col_buf =
+        static_cast<BsrRowCol*>(bsr_reserve_scratch(context, 1, 2 * size_t(nnz) * sizeof(BsrRowCol)));
+    int* unique_triplet_count_buf = static_cast<int*>(bsr_reserve_scratch(context, 2, sizeof(int)));
 
     bool return_summed_blocks = tpl_block_offsets != nullptr && tpl_block_indices != nullptr;
-    if (!return_summed_blocks) {
-        // if not provided, allocate temporary offset and indices buffers
-        tpl_block_offsets = static_cast<int*>(wp_alloc_device(context, size_t(nnz) * sizeof(int), "(native:sparse)"));
-        tpl_block_indices = static_cast<int*>(wp_alloc_device(context, size_t(nnz) * sizeof(int), "(native:sparse)"));
-    }
 
+    // All buffers read/written by CUB device algorithms (radix sort, run-length
+    // encode, inclusive scan) must be persistent rather than graph-captured
+    // mempool allocations. On non-default HIP devices, CUB operating on memory
+    // that was allocated inside a graph capture faults during replay (the
+    // caller-provided summed_triplet_offsets/indices arrays are allocated inside
+    // the capture). We therefore compute the topology entirely in persistent
+    // per-stream scratch and copy the results into the caller-provided output
+    // buffers at the end.
+    int* block_indices_buf = static_cast<int*>(bsr_reserve_scratch(context, 3, size_t(nnz) * sizeof(int)));
+    int* block_offsets_buf = static_cast<int*>(bsr_reserve_scratch(context, 4, size_t(nnz) * sizeof(int)));
+    int* run_offsets_buf = static_cast<int*>(bsr_reserve_scratch(context, 5, size_t(nnz) * sizeof(int)));
 
-    cub::DoubleBuffer<int> d_keys(tpl_block_indices, tpl_block_offsets);
-    cub::DoubleBuffer<BsrRowCol> d_values(combined_row_col.buffer(), combined_row_col.buffer() + nnz);
+    cub::DoubleBuffer<int> d_keys(block_indices_buf, block_offsets_buf);
+    cub::DoubleBuffer<BsrRowCol> d_values(combined_row_col_buf, combined_row_col_buf + nnz);
 
     // Combine rows and columns so we can sort on them both,
     // ensuring that blocks that should be pruned are moved to the end
@@ -331,16 +374,8 @@ WP_API void wp_bsr_matrix_from_triplets_device(
     {
         size_t buff_size = 0;
         check_cuda(cub::DeviceRadixSort::SortPairs(nullptr, buff_size, d_values, d_keys, nnz, 0, 64, stream));
-        ScopedTemporary<> temp(context, buff_size);
-        check_cuda(cub::DeviceRadixSort::SortPairs(temp.buffer(), buff_size, d_values, d_keys, nnz, 0, 64, stream));
-
-        // Depending on data size and GPU architecture buffers may have been swapped or not
-        // Ensures the sorted keys are available in summed_block_indices if needed
-        if (return_summed_blocks && d_keys.Current() != tpl_block_indices) {
-            check_cuda(cudaMemcpyAsync(
-                tpl_block_indices, d_keys.Current(), nnz * sizeof(int), cudaMemcpyDeviceToDevice, stream
-            ));
-        }
+        void* temp = bsr_reserve_cub_temp(context, buff_size);
+        check_cuda(cub::DeviceRadixSort::SortPairs(temp, buff_size, d_values, d_keys, nnz, 0, 64, stream));
     }
 
     // Runlength encode row-col sequences
@@ -348,15 +383,15 @@ WP_API void wp_bsr_matrix_from_triplets_device(
         size_t buff_size = 0;
         check_cuda(
             cub::DeviceRunLengthEncode::Encode(
-                nullptr, buff_size, d_values.Current(), d_values.Alternate(), tpl_block_offsets,
-                unique_triplet_count.buffer(), nnz, stream
+                nullptr, buff_size, d_values.Current(), d_values.Alternate(), run_offsets_buf,
+                unique_triplet_count_buf, nnz, stream
             )
         );
-        ScopedTemporary<> temp(context, buff_size);
+        void* temp = bsr_reserve_cub_temp(context, buff_size);
         check_cuda(
             cub::DeviceRunLengthEncode::Encode(
-                temp.buffer(), buff_size, d_values.Current(), d_values.Alternate(), tpl_block_offsets,
-                unique_triplet_count.buffer(), nnz, stream
+                temp, buff_size, d_values.Current(), d_values.Alternate(), run_offsets_buf,
+                unique_triplet_count_buf, nnz, stream
             )
         );
     }
@@ -364,7 +399,7 @@ WP_API void wp_bsr_matrix_from_triplets_device(
     // Compute row offsets from sorted unique blocks
     wp_launch_device(
         WP_CURRENT_CONTEXT, bsr_find_row_offsets, row_count + 1,
-        (row_count, unique_triplet_count.buffer(), d_values.Alternate(), bsr_offsets)
+        (row_count, unique_triplet_count_buf, d_values.Alternate(), bsr_offsets)
     );
 
     if (bsr_nnz) {
@@ -383,20 +418,24 @@ WP_API void wp_bsr_matrix_from_triplets_device(
         WP_CURRENT_CONTEXT, bsr_set_column, nnz, (bsr_offsets + row_count, d_values.Alternate(), bsr_columns)
     );
 
-    // Scan repeated block counts
+    // Scan repeated block counts and copy the summed topology into the
+    // caller-provided output buffers (which may be graph-captured allocations).
     if (return_summed_blocks) {
         size_t buff_size = 0;
         check_cuda(
-            cub::DeviceScan::InclusiveSum(nullptr, buff_size, tpl_block_offsets, tpl_block_offsets, nnz, stream)
+            cub::DeviceScan::InclusiveSum(nullptr, buff_size, run_offsets_buf, run_offsets_buf, nnz, stream)
         );
-        ScopedTemporary<> temp(context, buff_size);
+        void* temp = bsr_reserve_cub_temp(context, buff_size);
         check_cuda(
-            cub::DeviceScan::InclusiveSum(temp.buffer(), buff_size, tpl_block_offsets, tpl_block_offsets, nnz, stream)
+            cub::DeviceScan::InclusiveSum(temp, buff_size, run_offsets_buf, run_offsets_buf, nnz, stream)
         );
-    } else {
-        // free our temporary buffers
-        wp_free_device(context, tpl_block_offsets);
-        wp_free_device(context, tpl_block_indices);
+
+        check_cuda(cudaMemcpyAsync(
+            tpl_block_offsets, run_offsets_buf, size_t(nnz) * sizeof(int), cudaMemcpyDeviceToDevice, stream
+        ));
+        check_cuda(cudaMemcpyAsync(
+            tpl_block_indices, d_keys.Current(), size_t(nnz) * sizeof(int), cudaMemcpyDeviceToDevice, stream
+        ));
     }
 }
 
@@ -431,8 +470,8 @@ WP_API void wp_bsr_transpose_device(
     {
         size_t buff_size = 0;
         check_cuda(cub::DeviceRadixSort::SortPairs(nullptr, buff_size, d_values, d_keys, nnz, 0, 64, stream));
-        ScopedTemporary<> temp(context, buff_size);
-        check_cuda(cub::DeviceRadixSort::SortPairs(temp.buffer(), buff_size, d_values, d_keys, nnz, 0, 64, stream));
+        void* temp = bsr_reserve_cub_temp(context, buff_size);
+        check_cuda(cub::DeviceRadixSort::SortPairs(temp, buff_size, d_values, d_keys, nnz, 0, 64, stream));
 
         // Depending on data size and GPU architecture buffers may have been swapped or not
         // Ensures the sorted keys are available in summed_block_indices if needed

@@ -3240,6 +3240,39 @@ bool wp_cuda_graph_update_memcpy_batch(
     return true;
 }
 
+// Pause/resume of an in-progress stream capture. These use only standard
+// capture APIs (cudaStreamEndCapture / cudaStreamBeginCaptureToGraph, both
+// aliased for HIP in hip_util.h) and are independent of conditional graph
+// nodes, so they are compiled for all backends including HIP/ROCm.
+bool wp_cuda_graph_pause_capture(void* context, void* stream, void** graph_ret)
+{
+    ContextGuard guard(context);
+
+    CUstream cuda_stream = static_cast<CUstream>(stream);
+    if (!check_cuda(cudaStreamEndCapture(cuda_stream, (cudaGraph_t*)graph_ret)))
+        return false;
+    return true;
+}
+
+bool wp_cuda_graph_resume_capture(void* context, void* stream, void* graph)
+{
+    ContextGuard guard(context);
+
+    CUstream cuda_stream = static_cast<CUstream>(stream);
+    cudaGraph_t cuda_graph = static_cast<cudaGraph_t>(graph);
+
+    std::vector<cudaGraphNode_t> leaf_nodes;
+    if (!get_graph_leaf_nodes(cuda_graph, leaf_nodes))
+        return false;
+
+    if (!check_cuda(cudaStreamBeginCaptureToGraph(
+            cuda_stream, cuda_graph, leaf_nodes.data(), nullptr, leaf_nodes.size(), cudaStreamCaptureModeThreadLocal
+        )))
+        return false;
+
+    return true;
+}
+
 // Support for conditional graph nodes available with CUDA 12.4+.
 #if !defined(__HIP_PLATFORM_AMD__) && CUDA_VERSION >= 12040
 
@@ -3385,35 +3418,6 @@ static CUfunction get_conditional_kernel(void* context, int arch, bool use_ptx, 
     }
 
     return kernel;
-}
-
-bool wp_cuda_graph_pause_capture(void* context, void* stream, void** graph_ret)
-{
-    ContextGuard guard(context);
-
-    CUstream cuda_stream = static_cast<CUstream>(stream);
-    if (!check_cuda(cudaStreamEndCapture(cuda_stream, (cudaGraph_t*)graph_ret)))
-        return false;
-    return true;
-}
-
-bool wp_cuda_graph_resume_capture(void* context, void* stream, void* graph)
-{
-    ContextGuard guard(context);
-
-    CUstream cuda_stream = static_cast<CUstream>(stream);
-    cudaGraph_t cuda_graph = static_cast<cudaGraph_t>(graph);
-
-    std::vector<cudaGraphNode_t> leaf_nodes;
-    if (!get_graph_leaf_nodes(cuda_graph, leaf_nodes))
-        return false;
-
-    if (!check_cuda(cudaStreamBeginCaptureToGraph(
-            cuda_stream, cuda_graph, leaf_nodes.data(), nullptr, leaf_nodes.size(), cudaStreamCaptureModeThreadLocal
-        )))
-        return false;
-
-    return true;
 }
 
 // https://developer.nvidia.com/blog/constructing-cuda-graphs-with-dynamic-parameters/#combined_approach
@@ -3806,18 +3810,6 @@ bool wp_cuda_graph_set_condition(void* context, void* stream, int arch, bool use
 
 #else
 // stubs for conditional graph node API if CUDA toolkit is too old.
-
-bool wp_cuda_graph_pause_capture(void* context, void* stream, void** graph_ret)
-{
-    wp::set_error_string("Warp error: Warp must be built with CUDA Toolkit 12.4+ to enable conditional graph nodes");
-    return false;
-}
-
-bool wp_cuda_graph_resume_capture(void* context, void* stream, void* graph)
-{
-    wp::set_error_string("Warp error: Warp must be built with CUDA Toolkit 12.4+ to enable conditional graph nodes");
-    return false;
-}
 
 bool wp_cuda_graph_insert_if_else(
     void* context, void* stream, int arch, bool use_ptx, int* condition, void** if_graph_ret, void** else_graph_ret

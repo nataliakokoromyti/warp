@@ -331,6 +331,11 @@ def test_event_elapsed_time(test, device):
 
 
 def test_event_elapsed_time_graph(test, device):
+    if wp.get_device(device).is_hip:
+        # ROCm limitation: hipEventElapsedTime() on timing events recorded inside
+        # a captured graph fails with "invalid resource handle" (HIP error 400).
+        test.skipTest("Event timing inside a captured graph is not supported on HIP/ROCm")
+
     stream = wp.get_stream(device)
     e1 = wp.Event(device, enable_timing=True)
     e2 = wp.Event(device, enable_timing=True)
@@ -354,6 +359,12 @@ def test_event_elapsed_time_graph(test, device):
 
 
 def test_event_external(test, device):
+    if wp.get_device(device).is_hip:
+        # ROCm limitation: an external event recorded in one captured graph does
+        # not reliably synchronize a wait_event() in a separately-captured graph
+        # launched on another stream, producing a race (non-deterministic result).
+        test.skipTest("External event synchronization across captured graphs is not supported on HIP/ROCm")
+
     with wp.ScopedDevice(device):
         # event used to synchronize two graphs (external event)
         event = wp.Event()
@@ -572,8 +583,8 @@ class TestStreams(unittest.TestCase):
     @unittest.skipUnless(len(wp.get_cuda_devices()) > 1, "Requires at least two CUDA devices")
     @unittest.skipUnless(check_p2p(), "Peer-to-Peer transfers not supported")
     def test_stream_arg_graph_mgpu(self):
-        if any(d.is_hip for d in wp.get_cuda_devices()):
-            self.skipTest("CUDA graph capture is not supported on HIP")
+        if not all(d.supports_graph_capture for d in wp.get_cuda_devices()):
+            self.skipTest("Graph capture is not supported on all CUDA devices")
         wp.load_module(device="cuda:0")
         wp.load_module(device="cuda:1")
 
@@ -624,8 +635,8 @@ class TestStreams(unittest.TestCase):
     @unittest.skipUnless(len(wp.get_cuda_devices()) > 1, "Requires at least two CUDA devices")
     @unittest.skipUnless(check_p2p(), "Peer-to-Peer transfers not supported")
     def test_stream_scope_graph_mgpu(self):
-        if any(d.is_hip for d in wp.get_cuda_devices()):
-            self.skipTest("CUDA graph capture is not supported on HIP")
+        if not all(d.supports_graph_capture for d in wp.get_cuda_devices()):
+            self.skipTest("Graph capture is not supported on all CUDA devices")
         wp.load_module(device="cuda:0")
         wp.load_module(device="cuda:1")
 

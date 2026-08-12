@@ -128,8 +128,7 @@ def get_cuda_test_devices(mode=None):
 
 def get_graph_capture_test_devices(mode: str | None = None):
     """Subset of :func:`get_test_devices` filtered to devices that support
-    native graph capture (CPU and non-HIP CUDA). HIP/ROCm devices are excluded
-    because :func:`warp.capture_begin` is a no-op on them; see
+    native graph capture (CPU, CUDA, and HIP/ROCm); see
     ``Device.supports_graph_capture``.
     """
     return [d for d in get_test_devices(mode=mode) if d.supports_graph_capture]

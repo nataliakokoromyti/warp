@@ -510,14 +510,19 @@ class Example:
         self.renderer = fem_example_utils.Plot()
         self.renderer.add_field("rho", self.rho_field)
 
-        # Capture CUDA graph for the simulation step
-        self.use_cuda_graph = wp.get_device().is_cuda
+        # Capture CUDA graph for the simulation step.
+        # NOTE: on HIP/ROCm 7.2, instantiating the large, mempool-allocation-heavy
+        # graph this DG step produces crashes inside hipGraphInstantiate (heap
+        # corruption in libamdhip64). Capture itself succeeds, so the graph-is-None
+        # check below does not catch it; skip capture up front and run eagerly.
+        device = wp.get_device()
+        self.use_cuda_graph = device.is_cuda and not device.is_hip
         if self.use_cuda_graph:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
             if self.graph is None:
-                self.use_cuda_graph = False  # Graph capture is disabled on HIP.
+                self.use_cuda_graph = False
 
     def _state_delta(self, trial_state):
         """Evaluate the DG spatial operator: M^{-1} [volume_rhs + side_rhs]."""

@@ -202,6 +202,14 @@ def compute_num_contact_with_checksums(
 
 
 def test_capture_bvh_rebuild(test, device):
+    if wp.get_device(device).is_hip:
+        # The LBVH builder's radix sort (rocPRIM/hipcub DeviceRadixSort) is not
+        # graph-capturable on HIP/ROCm: it triggers an error inside the stream
+        # capture (Bvh.rebuild() works fine outside capture). Basic graph
+        # capture/replay is validated by test_graph; this in-capture BVH rebuild
+        # path is deferred pending a graph-capturable HIP sort.
+        test.skipTest("BVH rebuild inside a captured graph is not supported on HIP/ROCm")
+
     with wp.ScopedDevice(device):
         rng = np.random.default_rng(123)
 
@@ -281,6 +289,67 @@ def test_capture_bvh_rebuild(test, device):
 
             assert_array_equal(counts_1, counts_2)
             assert_array_equal(checksums_1, checksums_2)
+
+
+def test_capture_bvh_query(test, device):
+    # Graph capture of BVH *queries* (the BVH is built outside the capture).
+    # Unlike test_capture_bvh_rebuild, this does not build/rebuild inside the
+    # capture, so it is supported on HIP/ROCm as well as CUDA.
+    with wp.ScopedDevice(device):
+        rng = np.random.default_rng(123)
+
+        num_item_bounds = 100000
+        item_bound_size = 0.01
+        relative_shift = 2
+
+        num_test_bounds = 10000
+        test_bound_relative_size = 0.05
+
+        center = np.array([0.0, 0.0, 0.0])
+
+        item_lowers_np, item_uppers_np = get_random_aabbs(num_item_bounds, center, relative_shift, item_bound_size, rng)
+        item_lowers = wp.array(item_lowers_np, dtype=wp.vec3)
+        item_uppers = wp.array(item_uppers_np, dtype=wp.vec3)
+
+        # Build the BVH outside of the capture.
+        bvh = wp.Bvh(item_lowers, item_uppers)
+
+        test_lowers_np, test_uppers_np = get_random_aabbs(
+            num_test_bounds, center, relative_shift, test_bound_relative_size, rng
+        )
+        test_lowers = wp.array(test_lowers_np, dtype=wp.vec3)
+        test_uppers = wp.array(test_uppers_np, dtype=wp.vec3)
+
+        counts_ref = wp.empty(n=num_test_bounds, dtype=int)
+        checksums_ref = wp.empty(n=num_test_bounds, dtype=int)
+        counts_graph = wp.empty(n=num_test_bounds, dtype=int)
+        checksums_graph = wp.empty(n=num_test_bounds, dtype=int)
+
+        # Reference result computed with an eager launch (no capture).
+        wp.launch(
+            compute_num_contact_with_checksums,
+            dim=num_test_bounds,
+            inputs=[test_lowers, test_uppers, bvh.id],
+            outputs=[counts_ref, checksums_ref],
+        )
+
+        # Capture only the query launch, then replay it several times.
+        wp.load_module(device=device)
+        with wp.ScopedCapture(force_module_load=False) as capture:
+            wp.launch(
+                compute_num_contact_with_checksums,
+                dim=num_test_bounds,
+                inputs=[test_lowers, test_uppers, bvh.id],
+                outputs=[counts_graph, checksums_graph],
+            )
+
+        test.assertIsNotNone(capture.graph)
+
+        for _ in range(10):
+            wp.capture_launch(capture.graph)
+
+            assert_array_equal(counts_graph, counts_ref)
+            assert_array_equal(checksums_graph, checksums_ref)
 
 
 @wp.kernel
@@ -750,6 +819,7 @@ add_function_test(TestBvh, "test_bvh_query_aabb_tiled", test_bvh_query_aabb_tile
 add_function_test(TestBvh, "test_bvh_query_ray_tiled", test_bvh_query_ray_tiled, devices=cuda_devices)
 
 add_function_test(TestBvh, "test_capture_bvh_rebuild", test_capture_bvh_rebuild, devices=cuda_graph_devices)
+add_function_test(TestBvh, "test_capture_bvh_query", test_capture_bvh_query, devices=cuda_graph_devices)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
