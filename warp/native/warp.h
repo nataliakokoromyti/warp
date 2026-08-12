@@ -418,6 +418,7 @@ WP_API int wp_cuda_device_get_pci_device_id(int ordinal);
 WP_API int wp_cuda_device_is_uva(int ordinal);
 WP_API int wp_cuda_device_is_mempool_supported(int ordinal);
 WP_API int wp_cuda_device_is_ipc_supported(int ordinal);
+WP_API int wp_cuda_device_is_texture_supported(int ordinal);
 WP_API int wp_cuda_device_set_mempool_release_threshold(int ordinal, uint64_t threshold);
 WP_API uint64_t wp_cuda_device_get_mempool_release_threshold(int ordinal);
 WP_API uint64_t wp_cuda_device_get_mempool_used_mem_current(int ordinal);

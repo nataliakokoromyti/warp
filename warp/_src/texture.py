@@ -355,6 +355,13 @@ class Texture:
 
         # create texture
         if device.is_cuda:
+            if not device.is_texture_supported:
+                raise RuntimeError(
+                    f"Device '{device}' ({device.name}) does not support textures: "
+                    "the hardware has no image/texture units (hipDeviceAttributeImageSupport is 0; "
+                    "typical for AMD CDNA compute GPUs). Check device.is_texture_supported before "
+                    "creating textures."
+                )
             # create CUDA array if it was not provided
             if not self._array_handle:
                 self._array_owner = True

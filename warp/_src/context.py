@@ -3828,6 +3828,7 @@ class Device:
             self.is_mempool_supported = False
             self.is_mempool_enabled = False
             self.is_ipc_supported = False  # TODO: Support IPC for CPU arrays
+            self.is_texture_supported = False
             self.is_cubin_supported = False
             self.uuid = None
             self.pci_bus_id = None
@@ -3856,6 +3857,7 @@ class Device:
             self.max_shared_memory_per_block = runtime.core.wp_cuda_device_get_max_shared_memory(ordinal)
             self.is_uva = runtime.core.wp_cuda_device_is_uva(ordinal) > 0
             self.is_mempool_supported = runtime.core.wp_cuda_device_is_mempool_supported(ordinal) > 0
+            self.is_texture_supported = runtime.core.wp_cuda_device_is_texture_supported(ordinal) > 0
             if platform.system() == "Linux":
                 # Use None when IPC support cannot be determined
                 ipc_support_api_query = runtime.core.wp_cuda_device_is_ipc_supported(ordinal)
@@ -5420,6 +5422,8 @@ class Runtime:
             self.core.wp_cuda_device_is_mempool_supported.restype = ctypes.c_int
             self.core.wp_cuda_device_is_ipc_supported.argtypes = [ctypes.c_int]
             self.core.wp_cuda_device_is_ipc_supported.restype = ctypes.c_int
+            self.core.wp_cuda_device_is_texture_supported.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_is_texture_supported.restype = ctypes.c_int
             self.core.wp_cuda_device_set_mempool_release_threshold.argtypes = [ctypes.c_int, ctypes.c_uint64]
             self.core.wp_cuda_device_set_mempool_release_threshold.restype = ctypes.c_int
             self.core.wp_cuda_device_get_mempool_release_threshold.argtypes = [ctypes.c_int]
