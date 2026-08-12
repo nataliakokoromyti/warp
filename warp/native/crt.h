@@ -54,6 +54,14 @@ extern "C" WP_API int _wp_isinf(double);
 #include <stdlib.h>
 #include <string.h>
 
+// glibc's math.h defines these as function-like macros, which break Warp's
+// C++ overloads in vec.h/mat.h. The libstdc++ <cmath> wrapper normally
+// neutralizes them, but HIPRTC device compiles can resolve <math.h> to the
+// raw C header depending on the detected GCC toolchain's include order.
+#undef isfinite
+#undef isnan
+#undef isinf
+
 #else
 
 // These definitions are taken from Jitify: https://github.com/NVIDIA/jitify
