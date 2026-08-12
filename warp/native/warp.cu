@@ -171,6 +171,7 @@ struct DeviceInfo {
     int is_mempool_supported = 0;
     int sm_count = 0;
     int is_ipc_supported = -1;
+    int is_texture_supported = 1;
     int max_smem_bytes = 0;
     CUcontext primary_context = NULL;
 };
@@ -353,6 +354,15 @@ int cuda_init()
                 check_cu(cuDeviceGetAttribute_f(
                     &g_devices[i].max_smem_bytes, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device
                 ));
+#if defined(__HIP_PLATFORM_AMD__)
+                // CDNA GPUs (MI100+) are compute-only dies with no image/texture
+                // hardware; hipArray/hipTexObject creation fails with
+                // hipErrorNotSupported there. RDNA GPUs report support.
+                g_devices[i].is_texture_supported = 0;
+                check_cu(cuDeviceGetAttribute_f(
+                    &g_devices[i].is_texture_supported, hipDeviceAttributeImageSupport, device
+                ));
+#endif
 #if !defined(__HIP_PLATFORM_AMD__)
                 int major = 0;
                 int minor = 0;
@@ -2820,6 +2830,13 @@ int wp_cuda_device_is_ipc_supported(int ordinal)
 {
     if (ordinal >= 0 && ordinal < int(g_devices.size()))
         return g_devices[ordinal].is_ipc_supported;
+    return 0;
+}
+
+int wp_cuda_device_is_texture_supported(int ordinal)
+{
+    if (ordinal >= 0 && ordinal < int(g_devices.size()))
+        return g_devices[ordinal].is_texture_supported;
     return 0;
 }
 

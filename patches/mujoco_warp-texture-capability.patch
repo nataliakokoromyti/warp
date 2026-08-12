@@ -1,0 +1,86 @@
+diff --git a/mujoco_warp/_src/io.py b/mujoco_warp/_src/io.py
+index a9002e6..2d61c02 100644
+--- a/mujoco_warp/_src/io.py
++++ b/mujoco_warp/_src/io.py
+@@ -4065,14 +4065,22 @@ def create_render_context(
+       flex_bvh_id[f] = fmesh.id
+       flex_group_root[:, f] = group_root.numpy()
+ 
++  # Devices without image/texture hardware (e.g. AMD CDNA compute GPUs) cannot
++  # create textures; render untextured there. Texture sampling is compiled out
++  # via wp.static(use_textures) so an empty registry is safe.
++  if use_textures and not getattr(wp.get_device(), "is_texture_supported", True):
++    warnings.warn("Device has no texture hardware support; rendering with textures disabled.")
++    use_textures = False
++
+   textures_registry = []
+-  for i in range(mjm.ntex):
+-    textures_registry.append(render_util.create_warp_texture(mjm, i))
++  if use_textures:
++    for i in range(mjm.ntex):
++      textures_registry.append(render_util.create_warp_texture(mjm, i))
+   textures = wp.array(textures_registry, dtype=wp.Texture2D)
+ 
+   # Locate skybox texture
+   skybox_tex_ids = np.nonzero(mjm.tex_type == mujoco.mjtTexture.mjTEXTURE_SKYBOX)[0] if mjm.ntex else np.array([], dtype=int)
+-  if render_skybox and skybox_tex_ids.size > 0:
++  if use_textures and render_skybox and skybox_tex_ids.size > 0:
+     skybox_tex_id_np = np.array([skybox_tex_ids[0]], dtype=int)
+     skybox_face_width_np = np.array([mjm.tex_width[skybox_tex_ids[0]]], dtype=int)
+   else:
+diff --git a/mujoco_warp/_src/io_test.py b/mujoco_warp/_src/io_test.py
+index 1167751..e8f7737 100644
+--- a/mujoco_warp/_src/io_test.py
++++ b/mujoco_warp/_src/io_test.py
+@@ -2497,6 +2497,10 @@ class IOTest(parameterized.TestCase):
+     _assert_eq(rc.seg_adr.numpy(), [0], "seg_adr")
+     _assert_eq(rc.render_seg.numpy(), [True], "render_seg")
+ 
++  @absltest.skipUnless(
++      getattr(wp.get_device(), "is_texture_supported", True),
++      "device lacks texture hardware",
++  )
+   def test_render_context_with_textures(self):
+     mjm, mjd, m, d = test_data.fixture("mug/mug.xml")
+     rc = mjwarp.create_render_context(mjm, render_rgb=True, render_depth=True, use_textures=True)
+diff --git a/mujoco_warp/_src/render_test.py b/mujoco_warp/_src/render_test.py
+index dc0ef11..0be2619 100644
+--- a/mujoco_warp/_src/render_test.py
++++ b/mujoco_warp/_src/render_test.py
+@@ -192,6 +192,10 @@ class RenderTest(parameterized.TestCase):
+     rgb = _unpack_rgb(rc.rgb_data.numpy()[0]).reshape(32, 32, 3)
+     self.assertGreater(int(rgb.max()), 10, "directional light + headlight should still light the scene")
+ 
++  @absltest.skipUnless(
++      getattr(wp.get_device(), "is_texture_supported", True),
++      "device lacks texture hardware",
++  )
+   def test_render_per_world_mat_texid_batch_size(self):
+     """Tests render uses per-world material texture IDs allocated by put_model."""
+     nworld = 2
+@@ -470,6 +474,10 @@ class RenderTest(parameterized.TestCase):
+       "with cull disabled, enclosing geom should appear in segmentation",
+     )
+ 
++  @absltest.skipUnless(
++      getattr(wp.get_device(), "is_texture_supported", True),
++      "device lacks texture hardware",
++  )
+   def test_per_world_skybox_textures(self):
+     """Verifies that different skybox textures can be assigned to different worlds."""
+     # Load checkerboard skybox fixture (contains skybox and grid textures)
+diff --git a/mujoco_warp/_src/render_util_test.py b/mujoco_warp/_src/render_util_test.py
+index 9d2c2d8..bb536de 100644
+--- a/mujoco_warp/_src/render_util_test.py
++++ b/mujoco_warp/_src/render_util_test.py
+@@ -25,6 +25,10 @@ from mujoco_warp._src import types
+ 
+ 
+ class RenderUtilTest(absltest.TestCase):
++  @absltest.skipUnless(
++      getattr(wp.get_device(), "is_texture_supported", True),
++      "device lacks texture hardware",
++  )
+   def test_create_warp_texture(self):
+     """Tests that create_warp_texture creates a valid texture."""
+     mjm, mjd, m, d = test_data.fixture("ray.xml")
