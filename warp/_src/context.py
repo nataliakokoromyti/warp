@@ -1241,6 +1241,7 @@ def kernel(
     launch_bounds: tuple[int, ...] | int | None = None,
     module: Module | Literal["unique"] | str | None = None,
     module_options: dict[str, Any] | None = None,
+    grid_stride: bool | None = None,
 ):
     """
     Decorator to register a Warp kernel from a Python function.
@@ -1319,6 +1320,12 @@ def kernel(
 
         if launch_bounds is not None:
             kernel_options["launch_bounds"] = launch_bounds
+
+        # Accepted for compatibility with Warp >= 1.15, where grid_stride=False
+        # opts into a lean (no grid-stride loop) launch as a performance hint.
+        # This version always emits the grid-stride form, which is upstream's
+        # default semantics, so the hint is safely ignored.
+        _ = grid_stride
 
         # Resolve the module for this kernel
         if module is None:
