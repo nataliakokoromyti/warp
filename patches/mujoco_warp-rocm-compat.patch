@@ -1,8 +1,32 @@
+diff --git a/mujoco_warp/_src/forward_test.py b/mujoco_warp/_src/forward_test.py
+index 476b2a8..a23a267 100644
+--- a/mujoco_warp/_src/forward_test.py
++++ b/mujoco_warp/_src/forward_test.py
+@@ -340,6 +340,8 @@ class ForwardTest(parameterized.TestCase):
+   )
+   def test_graph_capture(self, xml, graph_conditional):
+     # TODO(team): test more environments
++    if graph_conditional and not getattr(wp, "is_conditional_graph_supported", lambda: True)():
++      self.skipTest("conditional graph nodes not supported on this device/driver")
+     _, _, m, d = test_data.fixture(xml, overrides={"opt.graph_conditional": graph_conditional})
+ 
+     with wp.ScopedCapture() as capture:
 diff --git a/mujoco_warp/_src/io.py b/mujoco_warp/_src/io.py
-index a9002e6..2d61c02 100644
+index a9002e6..79ffc34 100644
 --- a/mujoco_warp/_src/io.py
 +++ b/mujoco_warp/_src/io.py
-@@ -4065,14 +4065,22 @@ def create_render_context(
+@@ -431,7 +431,9 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
+   # warp only fields
+   opt.broadphase = types.BroadphaseType.NXN
+   opt.broadphase_filter = types.BroadphaseFilter.PLANE | types.BroadphaseFilter.SPHERE | types.BroadphaseFilter.OBB
+-  opt.graph_conditional = True
++  # Conditional graph nodes need CUDA >= 12.4 and are unsupported on HIP/ROCm;
++  # the non-conditional capture path is used automatically where unavailable.
++  opt.graph_conditional = getattr(wp, "is_conditional_graph_supported", lambda: True)()
+   opt.run_collision_detection = True
+   opt.warn_overflow = True
+   contact_sensor_maxmatch_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_NUMERIC, "contact_sensor_maxmatch")
+@@ -4065,14 +4067,22 @@ def create_render_context(
        flex_bvh_id[f] = fmesh.id
        flex_group_root[:, f] = group_root.numpy()
  
