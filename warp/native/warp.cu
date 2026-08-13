@@ -852,6 +852,12 @@ void* wp_alloc_device_default(void* context, size_t s, const char* tag)
 {
     ContextGuard guard(context);
 
+#if defined(__HIP_PLATFORM_AMD__)
+    // hipMalloc(0) returns a null pointer; CUDA returns a unique non-null
+    // pointer that callers treat as a valid allocation (NVIDIA/warp PR #1702).
+    if (s == 0)
+        s = 1;
+#endif
     void* ptr = NULL;
     check_cuda(cudaMalloc(&ptr, s));
 
@@ -886,6 +892,13 @@ void* wp_alloc_device_async(void* context, size_t s, void* stream_, const char* 
     // stream-ordered allocations don't rely on the current context,
     // but we set the context here for consistent behaviour
     ContextGuard guard(context);
+
+#if defined(__HIP_PLATFORM_AMD__)
+    // hipMallocAsync(0) returns a null pointer; match CUDA's unique non-null
+    // pointer semantics (NVIDIA/warp PR #1702).
+    if (s == 0)
+        s = 1;
+#endif
 
     CUstream stream;
     if (stream_ != WP_CURRENT_STREAM)
@@ -1434,6 +1447,11 @@ __global__ void memset_kernel(int* dest, int value, size_t n)
 
 bool wp_memset_device(void* context, void* dest, int value, size_t n, void* stream)
 {
+    // Zero-size memset is a no-op. CUDA tolerates it; ROCm 7.x returns
+    // hipErrorInvalidValue (see NVIDIA/warp PR #1702).
+    if (n == 0)
+        return true;
+
     ContextGuard guard(context);
 
     cudaStream_t cuda_stream;
