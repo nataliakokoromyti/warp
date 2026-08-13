@@ -108,3 +108,20 @@ index 9d2c2d8..bb536de 100644
    def test_create_warp_texture(self):
      """Tests that create_warp_texture creates a valid texture."""
      mjm, mjd, m, d = test_data.fixture("ray.xml")
+diff --git a/mujoco_warp/_src/warp_util.py b/mujoco_warp/_src/warp_util.py
+index 55fe2cf..d6d7fe3 100644
+--- a/mujoco_warp/_src/warp_util.py
++++ b/mujoco_warp/_src/warp_util.py
+@@ -143,7 +143,11 @@ def cache_kernel(func):
+ 
+ def check_toolkit_driver():
+   wp.init()
+-  if wp.get_device().is_cuda:
++  device = wp.get_device()
++  # On HIP/ROCm the toolkit version is a HIP version, not a CUDA version, and
++  # the absence of conditional graph nodes is expected (handled by the
++  # graph_conditional default) — the CUDA upgrade advice below does not apply.
++  if device.is_cuda and not getattr(device, "is_hip", False):
+     if not wp.is_conditional_graph_supported():
+       warnings.warn(
+         """
