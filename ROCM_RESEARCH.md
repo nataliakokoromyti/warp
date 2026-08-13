@@ -210,3 +210,26 @@ git log --oneline amd/amd-integration..upstream/main
 [numba-hip](https://github.com/ROCm/numba-hip) ·
 [Taichi AMDGPU backend](https://github.com/taichi-dev/taichi/issues/412) ·
 [CuPy ROCm deprecation](https://github.com/cupy/cupy/issues/8586)
+
+---
+
+## Addendum: MI350X validation campaign (2026-08-11/13)
+
+Executed on a Stanford cluster MI350X (gfx950, ROCm 7.2.0) — first public validation of the
+AMD port beyond MI325X/docker. Results:
+
+- **Warp full test suite: 5,590 tests, OK** (79 skips).
+- **Current mujoco_warp (main, warp-lang>=1.15 pin): 1,233 passed / 0 failed / 30 skips**
+  (skips: no texture hardware on CDNA, no conditional graph nodes in ROCm, torch absent).
+- **All 15 benchmarks run, every world converging.** Highlights: franka 2.50M steps/s @ 32,768
+  worlds; humanoid 614k; unitree_g1_flat 450k; unitree_g1_hfield_render 88.7k @ 8,192 worlds.
+  Cloth needs a larger contact budget than the NVIDIA-tuned config (physics verified correct
+  vs CPU reference over 1,000-step rollouts).
+
+Port fixes on this branch (upstream candidates for AMD-Ecosystem/warp): crt.h isfinite/isnan/
+isinf undef for hipRTC; grid_stride kwarg (Warp 1.15 compat); Device.is_texture_supported;
+zero-size memset/alloc guards (NVIDIA/warp PR #1702 parity); rocWMMA block_dim!=64 scalar
+fallback in tile_matmul. mujoco_warp fixes (patches/mujoco_warp-rocm-compat.patch, upstream
+candidates for google-deepmind): texture-less rendering, conditional-graph capability gating,
+HIP-aware toolkit check, deterministic island slot assignment (fixes latent scheduling-order
+nondeterminism present on NVIDIA as well).
