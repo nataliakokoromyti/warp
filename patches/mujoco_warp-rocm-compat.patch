@@ -53,7 +53,7 @@ index a9002e6..79ffc34 100644
      skybox_face_width_np = np.array([mjm.tex_width[skybox_tex_ids[0]]], dtype=int)
    else:
 diff --git a/mujoco_warp/_src/io_test.py b/mujoco_warp/_src/io_test.py
-index 1167751..e8f7737 100644
+index 1167751..689758b 100644
 --- a/mujoco_warp/_src/io_test.py
 +++ b/mujoco_warp/_src/io_test.py
 @@ -2497,6 +2497,10 @@ class IOTest(parameterized.TestCase):
@@ -67,6 +67,90 @@ index 1167751..e8f7737 100644
    def test_render_context_with_textures(self):
      mjm, mjd, m, d = test_data.fixture("mug/mug.xml")
      rc = mjwarp.create_render_context(mjm, render_rgb=True, render_depth=True, use_textures=True)
+@@ -2543,6 +2547,7 @@ class IOTest(parameterized.TestCase):
+     """Tests that check_toolkit_driver warns."""
+     mock_device = mock.MagicMock()
+     mock_device.is_cuda = True
++    mock_device.is_hip = False
+     with mock.patch("warp.get_device", return_value=mock_device):
+       with mock.patch("warp.is_conditional_graph_supported", return_value=False):
+         with self.assertWarns(UserWarning):
+diff --git a/mujoco_warp/_src/island.py b/mujoco_warp/_src/island.py
+index 9287fe8..16f61b1 100644
+--- a/mujoco_warp/_src/island.py
++++ b/mujoco_warp/_src/island.py
+@@ -359,13 +359,25 @@ def _island_map_dofs(
+   nidof = nidof_in[worldid]
+   island_id = dof_island_in[worldid, dofid]
+ 
++  # Slot assignment uses the deterministic rank of this dof among same-island
++  # predecessors (ascending dof order, matching MuJoCo) rather than the return
++  # value of an atomic counter, whose ordering is scheduling-dependent and
++  # differs across GPUs (observed on AMD wave64 vs NVIDIA).
+   if island_id >= 0:
+-    local_idx = wp.atomic_add(island_nv_inout, worldid, island_id, 1)
++    wp.atomic_add(island_nv_inout, worldid, island_id, 1)
++    local_idx = int(0)
++    for j in range(dofid):
++      if dof_island_in[worldid, j] == island_id:
++        local_idx += 1
+     idof = island_idofadr_in[worldid, island_id] + local_idx
+     idof_islandid_out[worldid, idof] = island_id
+     wp.atomic_min(island_dofadr_out, worldid, island_id, dofid)
+   else:
+-    cnt = wp.atomic_add(unconstrained_cnt_inout, worldid, 0, 1)
++    wp.atomic_add(unconstrained_cnt_inout, worldid, 0, 1)
++    cnt = int(0)
++    for j in range(dofid):
++      if dof_island_in[worldid, j] < 0:
++        cnt += 1
+     idof = nidof + cnt
+ 
+   map_dof2idof_out[worldid, dofid] = idof
+@@ -432,15 +444,39 @@ def _island_map_constraints(
+   if island_id >= 0:
+     efc_type = efc_type_in[worldid, efcid]
+ 
+-    # 1. Determine local index and absolute index ic based on category
++    # 1. Determine local index and absolute index ic based on category.
++    # The local index is the deterministic rank among same-island, same-category
++    # predecessors (ascending efc order, matching MuJoCo) rather than an atomic
++    # counter's return value, whose ordering is scheduling-dependent and differs
++    # across GPUs (observed on AMD wave64 vs NVIDIA).
+     if efc_type == ConstraintType.EQUALITY:
+-      local_idx = wp.atomic_add(island_ne_mapped_inout, worldid, island_id, 1)
++      wp.atomic_add(island_ne_mapped_inout, worldid, island_id, 1)
++      local_idx = int(0)
++      for j in range(efcid):
++        if efc_island_in[worldid, j] == island_id and efc_type_in[worldid, j] == ConstraintType.EQUALITY:
++          local_idx += 1
+       ic = island_iefcadr_in[worldid, island_id] + local_idx
+     elif efc_type == ConstraintType.FRICTION_DOF or efc_type == ConstraintType.FRICTION_TENDON:
+-      local_idx = wp.atomic_add(island_nf_mapped_inout, worldid, island_id, 1)
++      wp.atomic_add(island_nf_mapped_inout, worldid, island_id, 1)
++      local_idx = int(0)
++      for j in range(efcid):
++        if efc_island_in[worldid, j] == island_id:
++          jt = efc_type_in[worldid, j]
++          if jt == ConstraintType.FRICTION_DOF or jt == ConstraintType.FRICTION_TENDON:
++            local_idx += 1
+       ic = island_iefcadr_in[worldid, island_id] + island_ne_in[worldid, island_id] + local_idx
+     else:
+-      local_idx = wp.atomic_add(island_nother_mapped_inout, worldid, island_id, 1)
++      wp.atomic_add(island_nother_mapped_inout, worldid, island_id, 1)
++      local_idx = int(0)
++      for j in range(efcid):
++        if efc_island_in[worldid, j] == island_id:
++          jt = efc_type_in[worldid, j]
++          if (
++            jt != ConstraintType.EQUALITY
++            and jt != ConstraintType.FRICTION_DOF
++            and jt != ConstraintType.FRICTION_TENDON
++          ):
++            local_idx += 1
+       ic = (
+         island_iefcadr_in[worldid, island_id] + island_ne_in[worldid, island_id] + island_nf_in[worldid, island_id] + local_idx
+       )
 diff --git a/mujoco_warp/_src/render_test.py b/mujoco_warp/_src/render_test.py
 index dc0ef11..0be2619 100644
 --- a/mujoco_warp/_src/render_test.py
