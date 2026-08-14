@@ -1,0 +1,533 @@
+diff --git a/mujoco_warp/_src/collision_driver.py b/mujoco_warp/_src/collision_driver.py
+index 8613fa8..196ef64 100644
+--- a/mujoco_warp/_src/collision_driver.py
++++ b/mujoco_warp/_src/collision_driver.py
+@@ -911,8 +911,13 @@ def collision(
+     d.nacon.zero_()
+     return
+ 
+-  # TODO(team): create context outside collision?
+-  ctx = create_collision_context(d.naconmax)
++  # Reuse the collision context across calls: per-call allocation puts
++  # memAlloc/memFree nodes into captured graphs. Contents are workspace
++  # (uninitialized, like wp.empty) and are rebuilt by broadphase each call.
++  ctx = getattr(d, "_collision_ctx", None)
++  if ctx is None or ctx.collision_worldid.shape[0] != d.naconmax:
++    ctx = create_collision_context(d.naconmax)
++    d._collision_ctx = ctx
+ 
+   incremental = awake_prev is not None
+ 
+diff --git a/mujoco_warp/_src/constraint.py b/mujoco_warp/_src/constraint.py
+index 6dd318a..4e5b599 100644
+--- a/mujoco_warp/_src/constraint.py
++++ b/mujoco_warp/_src/constraint.py
+@@ -28,6 +28,7 @@ from mujoco_warp._src.types import vec6
+ from mujoco_warp._src.types import vec11
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
+ 
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+ 
+@@ -4870,7 +4871,7 @@ def _add_surface_vel(is_pyramidal: bool):
+ def make_constraint(m: types.Model, d: types.Data):
+   """Creates constraint jacobians and other supporting data."""
+   newton = m.opt.solver == types.SolverType.NEWTON
+-  efc_nnz = wp.empty((d.nworld,), dtype=int)
++  efc_nnz = scratch_empty(d, "constraint.efc_nnz", (d.nworld,), int)
+ 
+   wp.launch(
+     _zero_constraint_counts,
+diff --git a/mujoco_warp/_src/derivative.py b/mujoco_warp/_src/derivative.py
+index 90c1d5e..5e75822 100644
+--- a/mujoco_warp/_src/derivative.py
++++ b/mujoco_warp/_src/derivative.py
+@@ -30,6 +30,7 @@ from mujoco_warp._src.types import IntegratorType
+ from mujoco_warp._src.types import Model
+ from mujoco_warp._src.types import vec10
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
+ 
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+ 
+@@ -1129,7 +1130,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
+     # TODO(team): only clear elements not set by _qderiv_actuator_passive
+     out.zero_()
+     if m.nu > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
+-      vel = wp.empty((d.nworld, m.nu), dtype=float)
++      vel = scratch_empty(d, "derivative.vel", (d.nworld, m.nu), float)
+       wp.launch(
+         _qderiv_actuator_passive_vel,
+         dim=(d.nworld, m.nu),
+diff --git a/mujoco_warp/_src/forward.py b/mujoco_warp/_src/forward.py
+index bae3c3d..3c027fd 100644
+--- a/mujoco_warp/_src/forward.py
++++ b/mujoco_warp/_src/forward.py
+@@ -46,6 +46,7 @@ from mujoco_warp._src.types import TrnType
+ from mujoco_warp._src.types import vec10
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
+ 
+ wp.set_module_options({"enable_backward": False})
+ 
+@@ -579,7 +580,7 @@ def _map_m2d(
+ def implicit(m: Model, d: Data):
+   """Integrates fully implicit in velocity."""
+   if m.opt.integrator == IntegratorType.IMPLICIT:
+-    qH_M = wp.empty(d.M.shape, dtype=float)
++    qH_M = scratch_empty(d, "forward.implicit.qH_M", d.M.shape, float)
+ 
+     # 1. Compute M - dt * qDeriv_smooth in M-structure
+     derivative.deriv_smooth_vel(m, d, qH_M)
+@@ -596,16 +597,16 @@ def implicit(m: Model, d: Data):
+     derivative.deriv_rne_vel(m, d, d.qLU, flg_subtract=True)
+ 
+     # 4. Factorize and solve: qacc = qLU \ Ma
+-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
++    qacc = scratch_empty(d, "forward.implicit.qacc", (d.nworld, m.nv), float)
+     smooth.factor_solve_lu(m, d, d.qLU, qacc, d.efc.Ma)
+     _advance(m, d, qacc)
+   elif ~(m.opt.disableflags | ~(DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER)):
+     # qDeriv is in M-structure; the scratch qLD matches d.qLD (per-block).
+-    qDeriv = wp.empty((d.nworld, m.nC), dtype=float)
+-    qLD = wp.empty_like(d.qLD)
+-    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
++    qDeriv = scratch_empty(d, "forward.implicit.qDeriv", (d.nworld, m.nC), float)
++    qLD = scratch_empty(d, "forward.implicit.qLD", d.qLD.shape, d.qLD.dtype)
++    qLDiagInv = scratch_empty(d, "forward.implicit.qLDiagInv", (d.nworld, m.nv), float)
+     derivative.deriv_smooth_vel(m, d, qDeriv)
+-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
++    qacc = scratch_empty(d, "forward.implicit.qacc", (d.nworld, m.nv), float)
+     smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
+     _advance(m, d, qacc)
+   else:
+diff --git a/mujoco_warp/_src/forward_test.py b/mujoco_warp/_src/forward_test.py
+index 476b2a8..a23a267 100644
+--- a/mujoco_warp/_src/forward_test.py
++++ b/mujoco_warp/_src/forward_test.py
+@@ -340,6 +340,8 @@ class ForwardTest(parameterized.TestCase):
+   )
+   def test_graph_capture(self, xml, graph_conditional):
+     # TODO(team): test more environments
++    if graph_conditional and not getattr(wp, "is_conditional_graph_supported", lambda: True)():
++      self.skipTest("conditional graph nodes not supported on this device/driver")
+     _, _, m, d = test_data.fixture(xml, overrides={"opt.graph_conditional": graph_conditional})
+ 
+     with wp.ScopedCapture() as capture:
+diff --git a/mujoco_warp/_src/io.py b/mujoco_warp/_src/io.py
+index a9002e6..79ffc34 100644
+--- a/mujoco_warp/_src/io.py
++++ b/mujoco_warp/_src/io.py
+@@ -431,7 +431,9 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
+   # warp only fields
+   opt.broadphase = types.BroadphaseType.NXN
+   opt.broadphase_filter = types.BroadphaseFilter.PLANE | types.BroadphaseFilter.SPHERE | types.BroadphaseFilter.OBB
+-  opt.graph_conditional = True
++  # Conditional graph nodes need CUDA >= 12.4 and are unsupported on HIP/ROCm;
++  # the non-conditional capture path is used automatically where unavailable.
++  opt.graph_conditional = getattr(wp, "is_conditional_graph_supported", lambda: True)()
+   opt.run_collision_detection = True
+   opt.warn_overflow = True
+   contact_sensor_maxmatch_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_NUMERIC, "contact_sensor_maxmatch")
+@@ -4065,14 +4067,22 @@ def create_render_context(
+       flex_bvh_id[f] = fmesh.id
+       flex_group_root[:, f] = group_root.numpy()
+ 
++  # Devices without image/texture hardware (e.g. AMD CDNA compute GPUs) cannot
++  # create textures; render untextured there. Texture sampling is compiled out
++  # via wp.static(use_textures) so an empty registry is safe.
++  if use_textures and not getattr(wp.get_device(), "is_texture_supported", True):
++    warnings.warn("Device has no texture hardware support; rendering with textures disabled.")
++    use_textures = False
++
+   textures_registry = []
+-  for i in range(mjm.ntex):
+-    textures_registry.append(render_util.create_warp_texture(mjm, i))
++  if use_textures:
++    for i in range(mjm.ntex):
++      textures_registry.append(render_util.create_warp_texture(mjm, i))
+   textures = wp.array(textures_registry, dtype=wp.Texture2D)
+ 
+   # Locate skybox texture
+   skybox_tex_ids = np.nonzero(mjm.tex_type == mujoco.mjtTexture.mjTEXTURE_SKYBOX)[0] if mjm.ntex else np.array([], dtype=int)
+-  if render_skybox and skybox_tex_ids.size > 0:
++  if use_textures and render_skybox and skybox_tex_ids.size > 0:
+     skybox_tex_id_np = np.array([skybox_tex_ids[0]], dtype=int)
+     skybox_face_width_np = np.array([mjm.tex_width[skybox_tex_ids[0]]], dtype=int)
+   else:
+diff --git a/mujoco_warp/_src/io_test.py b/mujoco_warp/_src/io_test.py
+index 1167751..689758b 100644
+--- a/mujoco_warp/_src/io_test.py
++++ b/mujoco_warp/_src/io_test.py
+@@ -2497,6 +2497,10 @@ class IOTest(parameterized.TestCase):
+     _assert_eq(rc.seg_adr.numpy(), [0], "seg_adr")
+     _assert_eq(rc.render_seg.numpy(), [True], "render_seg")
+ 
++  @absltest.skipUnless(
++      getattr(wp.get_device(), "is_texture_supported", True),
++      "device lacks texture hardware",
++  )
+   def test_render_context_with_textures(self):
+     mjm, mjd, m, d = test_data.fixture("mug/mug.xml")
+     rc = mjwarp.create_render_context(mjm, render_rgb=True, render_depth=True, use_textures=True)
+@@ -2543,6 +2547,7 @@ class IOTest(parameterized.TestCase):
+     """Tests that check_toolkit_driver warns."""
+     mock_device = mock.MagicMock()
+     mock_device.is_cuda = True
++    mock_device.is_hip = False
+     with mock.patch("warp.get_device", return_value=mock_device):
+       with mock.patch("warp.is_conditional_graph_supported", return_value=False):
+         with self.assertWarns(UserWarning):
+diff --git a/mujoco_warp/_src/island.py b/mujoco_warp/_src/island.py
+index 9287fe8..16f61b1 100644
+--- a/mujoco_warp/_src/island.py
++++ b/mujoco_warp/_src/island.py
+@@ -359,13 +359,25 @@ def _island_map_dofs(
+   nidof = nidof_in[worldid]
+   island_id = dof_island_in[worldid, dofid]
+ 
++  # Slot assignment uses the deterministic rank of this dof among same-island
++  # predecessors (ascending dof order, matching MuJoCo) rather than the return
++  # value of an atomic counter, whose ordering is scheduling-dependent and
++  # differs across GPUs (observed on AMD wave64 vs NVIDIA).
+   if island_id >= 0:
+-    local_idx = wp.atomic_add(island_nv_inout, worldid, island_id, 1)
++    wp.atomic_add(island_nv_inout, worldid, island_id, 1)
++    local_idx = int(0)
++    for j in range(dofid):
++      if dof_island_in[worldid, j] == island_id:
++        local_idx += 1
+     idof = island_idofadr_in[worldid, island_id] + local_idx
+     idof_islandid_out[worldid, idof] = island_id
+     wp.atomic_min(island_dofadr_out, worldid, island_id, dofid)
+   else:
+-    cnt = wp.atomic_add(unconstrained_cnt_inout, worldid, 0, 1)
++    wp.atomic_add(unconstrained_cnt_inout, worldid, 0, 1)
++    cnt = int(0)
++    for j in range(dofid):
++      if dof_island_in[worldid, j] < 0:
++        cnt += 1
+     idof = nidof + cnt
+ 
+   map_dof2idof_out[worldid, dofid] = idof
+@@ -432,15 +444,39 @@ def _island_map_constraints(
+   if island_id >= 0:
+     efc_type = efc_type_in[worldid, efcid]
+ 
+-    # 1. Determine local index and absolute index ic based on category
++    # 1. Determine local index and absolute index ic based on category.
++    # The local index is the deterministic rank among same-island, same-category
++    # predecessors (ascending efc order, matching MuJoCo) rather than an atomic
++    # counter's return value, whose ordering is scheduling-dependent and differs
++    # across GPUs (observed on AMD wave64 vs NVIDIA).
+     if efc_type == ConstraintType.EQUALITY:
+-      local_idx = wp.atomic_add(island_ne_mapped_inout, worldid, island_id, 1)
++      wp.atomic_add(island_ne_mapped_inout, worldid, island_id, 1)
++      local_idx = int(0)
++      for j in range(efcid):
++        if efc_island_in[worldid, j] == island_id and efc_type_in[worldid, j] == ConstraintType.EQUALITY:
++          local_idx += 1
+       ic = island_iefcadr_in[worldid, island_id] + local_idx
+     elif efc_type == ConstraintType.FRICTION_DOF or efc_type == ConstraintType.FRICTION_TENDON:
+-      local_idx = wp.atomic_add(island_nf_mapped_inout, worldid, island_id, 1)
++      wp.atomic_add(island_nf_mapped_inout, worldid, island_id, 1)
++      local_idx = int(0)
++      for j in range(efcid):
++        if efc_island_in[worldid, j] == island_id:
++          jt = efc_type_in[worldid, j]
++          if jt == ConstraintType.FRICTION_DOF or jt == ConstraintType.FRICTION_TENDON:
++            local_idx += 1
+       ic = island_iefcadr_in[worldid, island_id] + island_ne_in[worldid, island_id] + local_idx
+     else:
+-      local_idx = wp.atomic_add(island_nother_mapped_inout, worldid, island_id, 1)
++      wp.atomic_add(island_nother_mapped_inout, worldid, island_id, 1)
++      local_idx = int(0)
++      for j in range(efcid):
++        if efc_island_in[worldid, j] == island_id:
++          jt = efc_type_in[worldid, j]
++          if (
++            jt != ConstraintType.EQUALITY
++            and jt != ConstraintType.FRICTION_DOF
++            and jt != ConstraintType.FRICTION_TENDON
++          ):
++            local_idx += 1
+       ic = (
+         island_iefcadr_in[worldid, island_id] + island_ne_in[worldid, island_id] + island_nf_in[worldid, island_id] + local_idx
+       )
+diff --git a/mujoco_warp/_src/render_test.py b/mujoco_warp/_src/render_test.py
+index dc0ef11..0be2619 100644
+--- a/mujoco_warp/_src/render_test.py
++++ b/mujoco_warp/_src/render_test.py
+@@ -192,6 +192,10 @@ class RenderTest(parameterized.TestCase):
+     rgb = _unpack_rgb(rc.rgb_data.numpy()[0]).reshape(32, 32, 3)
+     self.assertGreater(int(rgb.max()), 10, "directional light + headlight should still light the scene")
+ 
++  @absltest.skipUnless(
++      getattr(wp.get_device(), "is_texture_supported", True),
++      "device lacks texture hardware",
++  )
+   def test_render_per_world_mat_texid_batch_size(self):
+     """Tests render uses per-world material texture IDs allocated by put_model."""
+     nworld = 2
+@@ -470,6 +474,10 @@ class RenderTest(parameterized.TestCase):
+       "with cull disabled, enclosing geom should appear in segmentation",
+     )
+ 
++  @absltest.skipUnless(
++      getattr(wp.get_device(), "is_texture_supported", True),
++      "device lacks texture hardware",
++  )
+   def test_per_world_skybox_textures(self):
+     """Verifies that different skybox textures can be assigned to different worlds."""
+     # Load checkerboard skybox fixture (contains skybox and grid textures)
+diff --git a/mujoco_warp/_src/render_util_test.py b/mujoco_warp/_src/render_util_test.py
+index 9d2c2d8..bb536de 100644
+--- a/mujoco_warp/_src/render_util_test.py
++++ b/mujoco_warp/_src/render_util_test.py
+@@ -25,6 +25,10 @@ from mujoco_warp._src import types
+ 
+ 
+ class RenderUtilTest(absltest.TestCase):
++  @absltest.skipUnless(
++      getattr(wp.get_device(), "is_texture_supported", True),
++      "device lacks texture hardware",
++  )
+   def test_create_warp_texture(self):
+     """Tests that create_warp_texture creates a valid texture."""
+     mjm, mjd, m, d = test_data.fixture("ray.xml")
+diff --git a/mujoco_warp/_src/sensor.py b/mujoco_warp/_src/sensor.py
+index 6a2eb1d..297b1f4 100644
+--- a/mujoco_warp/_src/sensor.py
++++ b/mujoco_warp/_src/sensor.py
+@@ -49,6 +49,9 @@ from mujoco_warp._src.util_misc import inside_geom
+ from mujoco_warp._src.util_misc import poly_potential
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
++from mujoco_warp._src.warp_util import scratch_full
++from mujoco_warp._src.warp_util import scratch_zeros
+ 
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+ 
+@@ -813,12 +816,12 @@ def sensor_pos(m: Model, d: Data):
+     return
+ 
+   # rangefinder
+-  rangefinder_dist = wp.empty((d.nworld, m.nrangefinder), dtype=float)
++  rangefinder_dist = scratch_empty(d, "sensor.rangefinder_dist", (d.nworld, m.nrangefinder), float)
+   if m.sensor_rangefinder_adr.size > 0:
+-    rangefinder_pnt = wp.empty((d.nworld, m.nrangefinder), dtype=wp.vec3)
+-    rangefinder_vec = wp.empty((d.nworld, m.nrangefinder), dtype=wp.vec3)
+-    rangefinder_geomid = wp.empty((d.nworld, m.nrangefinder), dtype=int)
+-    rangefinder_normal = wp.empty((d.nworld, m.nrangefinder), dtype=wp.vec3)
++    rangefinder_pnt = scratch_empty(d, "sensor.rangefinder_pnt", (d.nworld, m.nrangefinder), wp.vec3)
++    rangefinder_vec = scratch_empty(d, "sensor.rangefinder_vec", (d.nworld, m.nrangefinder), wp.vec3)
++    rangefinder_geomid = scratch_empty(d, "sensor.rangefinder_geomid", (d.nworld, m.nrangefinder), int)
++    rangefinder_normal = scratch_empty(d, "sensor.rangefinder_normal", (d.nworld, m.nrangefinder), wp.vec3)
+ 
+     # get position and direction
+     wp.launch(
+@@ -849,7 +852,7 @@ def sensor_pos(m: Model, d: Data):
+     energy_vel(m, d)
+ 
+   # collision sensors (distance, normal, fromto)
+-  sensor_collision = wp.full((d.nworld, m.nsensorcollision, 8, 7), 1.0e32, dtype=float)
++  sensor_collision = scratch_full(d, "sensor.sensor_collision", (d.nworld, m.nsensorcollision, 8, 7), float, 1.0e32)
+   if m.nsensorcollision:
+     wp.launch(
+       _sensor_collision,
+@@ -2537,8 +2540,8 @@ def sensor_acc(m: Model, d: Data):
+     ],
+   )
+ 
+-  weld_geom_count = wp.zeros((d.nworld, m.nbody), dtype=int)
+-  weld_geom_list = wp.full((d.nworld, m.nbody, MJ_MAXCONPAIR), -1, dtype=int)
++  weld_geom_count = scratch_zeros(d, "sensor.weld_geom_count", (d.nworld, m.nbody), int)
++  weld_geom_list = scratch_full(d, "sensor.weld_geom_list", (d.nworld, m.nbody, MJ_MAXCONPAIR), int, -1)
+   wp.launch(
+     _preprocess_tactile_contacts,
+     dim=d.naconmax,
+@@ -2597,11 +2600,17 @@ def sensor_acc(m: Model, d: Data):
+     ],
+   )
+ 
+-  sensor_contact_nmatch = wp.empty((d.nworld, m.nsensorcontact), dtype=int)
+-  sensor_contact_matchid = wp.empty((d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), dtype=int)
+-  sensor_contact_direction = wp.empty((d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), dtype=float)
++  sensor_contact_nmatch = scratch_empty(d, "sensor.contact_nmatch", (d.nworld, m.nsensorcontact), int)
++  sensor_contact_matchid = scratch_empty(
++    d, "sensor.contact_matchid", (d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), int
++  )
++  sensor_contact_direction = scratch_empty(
++    d, "sensor.contact_direction", (d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), float
++  )
+   if m.nsensorcontact:
+-    sensor_contact_criteria = wp.empty((d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), dtype=float)
++    sensor_contact_criteria = scratch_empty(
++      d, "sensor.contact_criteria", (d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), float
++    )
+     # TODO(team): fill_ operations in one kernel?
+     sensor_contact_nmatch.fill_(0)
+     sensor_contact_matchid.fill_(-1)
+diff --git a/mujoco_warp/_src/smooth.py b/mujoco_warp/_src/smooth.py
+index c2ec372..01890c8 100644
+--- a/mujoco_warp/_src/smooth.py
++++ b/mujoco_warp/_src/smooth.py
+@@ -39,6 +39,8 @@ from mujoco_warp._src.types import vec10
+ from mujoco_warp._src.types import vec11
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
++from mujoco_warp._src.warp_util import scratch_zeros
+ 
+ wp.set_module_options({"enable_backward": False})
+ 
+@@ -2125,7 +2127,7 @@ def tendon_bias(m: Model, d: Data, qfrc: wp.array2d[float]):
+     qfrc: Force.
+   """
+   # time derivative of tendon Jacobian
+-  ten_Jdot = wp.zeros((d.nworld, m.nJten), dtype=float)
++  ten_Jdot = scratch_zeros(d, "smooth.ten_Jdot", (d.nworld, m.nJten), float)
+   wp.launch(
+     _tendon_dot,
+     dim=(d.nworld, m.ntendon),
+@@ -2157,7 +2159,7 @@ def tendon_bias(m: Model, d: Data, qfrc: wp.array2d[float]):
+   )
+ 
+   # tendon bias force coefficients
+-  ten_bias_coef = wp.zeros((d.nworld, m.ntendon), dtype=float)
++  ten_bias_coef = scratch_zeros(d, "smooth.ten_bias_coef", (d.nworld, m.ntendon), float)
+   wp.launch(
+     _tendon_bias_coef,
+     dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz),
+@@ -2892,7 +2894,7 @@ def transmission(m: Model, d: Data):
+   and tendon transmissions.
+   """
+   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
+-  moment_nnz = wp.zeros((d.nworld,), dtype=int)
++  moment_nnz = scratch_zeros(d, "smooth.moment_nnz", (d.nworld,), int)
+ 
+   wp.launch(
+     _transmission,
+@@ -3614,7 +3616,7 @@ def subtree_vel(m: Model, d: Data):
+   Computes the linear momentum and angular momentum for each subtree, accumulating
+   contributions up the kinematic tree.
+   """
+-  subtree_bodyvel = wp.empty((d.nworld, m.nbody), dtype=wp.spatial_vector)
++  subtree_bodyvel = scratch_empty(d, "smooth.subtree_bodyvel", (d.nworld, m.nbody), wp.spatial_vector)
+ 
+   # bodywise quantities
+   wp.launch(
+diff --git a/mujoco_warp/_src/solver.py b/mujoco_warp/_src/solver.py
+index 2b2964b..4aec496 100644
+--- a/mujoco_warp/_src/solver.py
++++ b/mujoco_warp/_src/solver.py
+@@ -32,6 +32,7 @@ from mujoco_warp._src.types import InverseContext
+ from mujoco_warp._src.types import SolverContext
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_full
+ 
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+ 
+@@ -3726,10 +3727,29 @@ def solve(m: types.Model, d: types.Data):
+     wp.copy(d.qacc, d.qacc_smooth)
+     d.solver_niter.fill_(0)
+   else:
+-    ctx = _create_solver_context(m, d)
++    ctx = _cached_solver_context(m, d)
+     _solve(m, d, ctx)
+ 
+ 
++def _cached_solver_context(m: types.Model, d: types.Data) -> SolverContext:
++  """Reuse the solver context across solves on the same Data.
++
++  Allocating the context on every solve puts memAlloc/memFree nodes into
++  captured graphs. Buffers that _create_solver_context allocates with zeros
++  are re-zeroed on reuse; the rest are workspace and need no initialization.
++  """
++  key = (m.nv, m.nv_pad, d.njmax, int(m.opt.solver), _use_incremental(m))
++  cached = getattr(d, "_solver_ctx_cache", None)
++  if cached is None or cached[0] != key:
++    ctx = _create_solver_context(m, d)
++    d._solver_ctx_cache = (key, ctx)
++    return ctx
++  ctx = cached[1]
++  ctx.grad.zero_()
++  ctx.ls_exhausted.zero_()
++  return ctx
++
++
+ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
+   """Finds forces that satisfy constraints."""
+   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
+@@ -3758,7 +3778,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
+       block_dim=m.block_dim.solve_init_search_cg,
+     )
+ 
+-  nsolving = wp.full(shape=(1,), value=d.nworld, dtype=int)
++  nsolving = scratch_full(d, "solver.nsolving", (1,), int, d.nworld)
+   if m.opt.iterations != 0 and m.opt.graph_conditional:
+     # Note: the iteration kernel (indicated by while_body) is repeatedly launched
+     # as long as condition_iteration is not zero.
+diff --git a/mujoco_warp/_src/warp_util.py b/mujoco_warp/_src/warp_util.py
+index 55fe2cf..36ab229 100644
+--- a/mujoco_warp/_src/warp_util.py
++++ b/mujoco_warp/_src/warp_util.py
+@@ -141,9 +141,53 @@ def cache_kernel(func):
+   return wrapper
+ 
+ 
++def _scratch_array(d, key: str, shape, dtype):
++  """Return a per-Data cached scratch array, allocating on first use.
++
++  Temporary arrays allocated inside step() become memAlloc/memFree nodes in
++  captured graphs (mempool allocations), which replay slowly on some platforms.
++  Caching them on Data keeps captured step graphs kernel-only. Arrays are
++  reallocated if the requested shape changes; contents persist between calls.
++  """
++  cache = getattr(d, "_scratch_arrays", None)
++  if cache is None:
++    cache = {}
++    d._scratch_arrays = cache
++  if not isinstance(shape, tuple):
++    shape = (shape,)
++  arr = cache.get(key)
++  if arr is None or arr.shape != shape:
++    arr = wp.empty(shape, dtype=dtype)
++    cache[key] = arr
++  return arr
++
++
++def scratch_empty(d, key: str, shape, dtype):
++  """Cached equivalent of ``wp.empty``: contents are uninitialized."""
++  return _scratch_array(d, key, shape, dtype)
++
++
++def scratch_zeros(d, key: str, shape, dtype):
++  """Cached equivalent of ``wp.zeros``: zeroed on every call."""
++  arr = _scratch_array(d, key, shape, dtype)
++  arr.zero_()
++  return arr
++
++
++def scratch_full(d, key: str, shape, dtype, value):
++  """Cached equivalent of ``wp.full``: filled with ``value`` on every call."""
++  arr = _scratch_array(d, key, shape, dtype)
++  arr.fill_(value)
++  return arr
++
++
+ def check_toolkit_driver():
+   wp.init()
+-  if wp.get_device().is_cuda:
++  device = wp.get_device()
++  # On HIP/ROCm the toolkit version is a HIP version, not a CUDA version, and
++  # the absence of conditional graph nodes is expected (handled by the
++  # graph_conditional default) — the CUDA upgrade advice below does not apply.
++  if device.is_cuda and not getattr(device, "is_hip", False):
+     if not wp.is_conditional_graph_supported():
+       warnings.warn(
+         """
