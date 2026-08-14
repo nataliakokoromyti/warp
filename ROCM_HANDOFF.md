@@ -23,40 +23,56 @@ Warp (this repo): `crt.h` isfinite/isnan/isinf undef for hipRTC; `grid_stride` k
 (Warp≥1.15 compat); `Device.is_texture_supported` (CDNA has **no texture hardware** —
 `hipDeviceAttributeImageSupport=0`); zero-size memset/alloc guards (NVIDIA/warp PR #1702
 parity); rocWMMA `block_dim != 64` scalar fallback in `tile.h` (was a compile-breaking
-static_assert; mujoco_warp launches solver tile kernels with block_dim=128).
+static_assert; mujoco_warp launches solver tile kernels with block_dim=128);
+**kernel-only graph capture** (`warp.cu`, HIP-only: while a stream is capturing,
+memset/memtile/d2d-memcpy are routed through trivial kernels instead of
+hipMemsetAsync/hipMemcpyAsync, so captured graphs contain no blit nodes).
 
 mujoco_warp (`patches/mujoco_warp-rocm-compat.patch`): texture-less rendering auto-disable;
 `graph_conditional` gated on `wp.is_conditional_graph_supported()`; HIP-aware toolkit check;
 **deterministic island slot assignment** (replaces scheduling-order-dependent atomic ranks —
-latent nondeterminism on NVIDIA too; parity test now passes).
+latent nondeterminism on NVIDIA too; parity test now passes); **per-step scratch cache**
+(`scratch_empty/zeros/full` in `warp_util.py` + cached solver/collision contexts — all 46
+per-step temporary allocations reuse Data-cached buffers, so warm-captured graphs contain
+no mempool memAlloc/memFree nodes).
 
-## THE open problem: graph replay performance
+## Graph replay performance — SOLVED (2026-08-13)
 
-Head-to-head vs AMD's published MI325X result (their mujoco_warp PR #1556: G1, 256 worlds,
-eager 2.4 ms → graph 1.4 ms/step):
+Graph replay was a net 2× regression (eager 4.8 ms vs graph 9–10 ms/step, G1@256; AMD's
+published MI325X result in mujoco_warp PR #1556 was eager 2.4 → graph 1.4). Root cause:
+ROCm replays kernel nodes fast (~1.7 µs/node) but stalls at fill/copy blit nodes and
+mempool alloc/free nodes. The fix has two parts:
 
-| Mode (G1, 256 worlds, MI350X) | ms/step |
+1. **Warp: kernel-only capture** (`warp/native/warp.cu`). During HIP stream capture,
+   `wp_memset_device`, `wp_memtile_device`, and `wp_memcpy_d2d` launch trivial fill/copy
+   kernels instead of hipMemsetAsync/hipMemcpyAsync. Eager execution and CUDA builds are
+   untouched. This alone: graph 10.3 → 8.9 ms/step.
+2. **mujoco_warp: per-step scratch cache** (in the compat patch, ported from the unmerged
+   parts of AMD's PR #1556 onto current main). Every per-step temporary (solver context,
+   collision context, sensor/tendon/transmission/implicit-integrator scratch, `nsolving`)
+   is cached on `Data` and re-zeroed/re-filled on reuse instead of reallocated, so no
+   memAlloc/memFree nodes are captured.
+
+Result (G1, 256 worlds, MI350X, ROCm 7.2):
+
+| Mode | ms/step |
 |---|---|
-| eager | **4.8** |
-| `wp.ScopedCapture` graph | 10.3 |
-| GlobalMode multi-stream graph (hipgraph-ms) | 9.2 |
+| eager | 4.16 |
+| **warm-capture graph** | **2.94** |
+| cold-capture graph | 8.72 |
 
-Graphs are a **net 2× regression** here. Diagnosed so far: the step graph has only **356
-nodes**, so replay costs ~26 µs/node, vs 1.7 µs/node for a synthetic 1000-node graph
-(measured: `rocm-tools/graph_overhead.py`) — ROCm graph replay pipelines real kernels poorly
-where eager stream submission overlaps them. Ruled out: solver iteration unrolling (capping
-iterations changes nothing), replay input syncs, multi-stream capture alone
-([zhihuidu-amd/hipgraph-ms](https://github.com/zhihuidu-amd/hipgraph-ms) gains only 10%).
+The warm-captured step graph is 288 nodes, **100% kernel nodes** (verified with
+`rocm-tools/graph_census.py`; before the fix it carried 34 memAlloc + 34 memFree + blit
+nodes). **Caveat: run a few eager steps before capturing** — a cold capture fires the
+scratch allocations *inside* the capture and re-inherits the alloc nodes (hence 8.72).
+`rocm-tools/alloc_trace.py` verifies zero allocations fire during a warm capture.
+Validated: full mujoco_warp suite green with both fixes (1,233 passed / 0 failed).
 
-Next levers, in order:
-1. Newer ROCm (7.3+/TheRock nightly) — graph replay pipelining is actively worked on.
-2. Port the *unmerged* extras from
-   [mujoco_warp PR #1556](https://github.com/google-deepmind/mujoco_warp/pull/1556)
-   (pre-allocated solver ctx / tendon scratch, event handling) — AMD's 1.4 ms used these.
-3. Profile one graph replay with rocprofv3 to see per-node gaps.
-4. Kernel-level optimization for gfx950 (block sizes, occupancy) — helps eager AND graph.
-5. Wave64 tile op tuning; rocWMMA coverage beyond 16x16 f32 (tile Cholesky in progress on
-   AMD's `amd/rocwmma-tile-matmul-cholesky` branch).
+Remaining perf levers: kernel-level gfx950 tuning (block sizes, occupancy — helps eager
+AND graph); wave64 tile op tuning; rocWMMA coverage beyond 16x16 f32 (tile Cholesky in
+progress on AMD's `amd/rocwmma-tile-matmul-cholesky` branch). The scratch cache is a
+strong upstream candidate for google-deepmind/mujoco_warp (CUDA graphs also carry alloc
+nodes); the kernel-only capture is AMD-specific (AMD-Ecosystem/warp).
 
 Also open: cloth benchmarks need `nconmax≈26000` vs the NVIDIA-tuned 2,200 (physics verified
 correct vs CPU over 1,000-step rollouts — accounting difference unexplained); event timing
@@ -100,7 +116,10 @@ fixes are all candidates — upstreaming them early keeps this branch small and 
 The AMD port (and this branch) is ~430 commits behind nvidia/warp main; syncing that forward
 is a valuable, separable workstream.
 
-## Graph-replay investigation results (5-agent campaign, 2026-08-13)
+## Graph-replay investigation results (5-agent campaign, 2026-08-13) — historical
+
+*Superseded by the fix above (lever 1, warp-side kernel-only capture + alloc hoisting,
+resolved it). Kept for the record of what was measured and eliminated.*
 
 Diagnosis (rocprof, G1@256): graph replay dispatches identical kernels at identical speed as
 eager; the entire ~5 ms gap is IDLE inside hipGraphLaunch replay (~62%), concentrated at
@@ -114,12 +133,9 @@ stream parallelism (branches verified present in graph — zero delta); node-cou
 pre-allocation (zero delta). Config-only best: euler integrator 8.3 ms graph; CG solver eager
 4.4 ms. Warp already instantiates with AutoFreeOnLaunch + hipGraphUpload.
 
-Practical guidance NOW: run eager on MI350X (4.4-4.8 ms/step @ 256 worlds; gap vanishes at
-8k+ worlds). Remaining unexplored levers, in order: (1) warp-side kernel-only capture —
-replace memset/copy (and ideally alloc) nodes with kernels during HIP capture, so the graph
-matches the fast synthetic case (1.7 us/node); (2) run the fixed split-graph sweep at
-/matx/u/knatalia/graphtune_agent/graphtune.py (~10 min job, was blocked by the 801 issue);
-(3) file a minimal repro with AMD — synthetic kernel-only graph replays at 1.7 us/node while
-real mixed-node graphs cost ~26 us/node; untested libamdhip64 knobs are listed in the gtune
-log. Full agent logs: /matx/u/knatalia/warp-rocm-logs/{prof_g1_16767817,node-sweep-16768261,
-gtune*-*,g1-streams-*,runtime-ab-*,isolate-16769579}.out.
+Levers that were listed here: (1) warp-side kernel-only capture — **done, this was the
+fix**; (2) split-graph sweep at /matx/u/knatalia/graphtune_agent/graphtune.py — moot;
+(3) minimal repro for AMD — still worth filing (kernel-only graphs replay at 1.7 us/node
+while blit/alloc nodes cost ~26 us/node; the workaround shouldn't be necessary). Full agent
+logs: /matx/u/knatalia/warp-rocm-logs/{prof_g1_16767817,node-sweep-16768261,gtune*-*,
+g1-streams-*,runtime-ab-*,isolate-16769579}.out.
