@@ -120,7 +120,15 @@ carry alloc nodes); the kernel-only capture is AMD-specific (AMD-Ecosystem/warp)
 2. `hipMalloc` during a thread-local stream capture **invalidates** the capture instead
    of failing cleanly like `cudaMalloc`, and an invalidated capture **cannot be
    terminated**: `hipStreamEndCapture` returns 908 and the stream stays in capture state
-   permanently (poisons the process).
+   permanently (poisons the process). **Root-caused in clr sources**: 7.2's
+   `hipStreamEndCapture_common` (hipamd/src/hip_graph.cpp) returns from the invalidated
+   branch without resetting the stream's capture status; the erased thread-ownership
+   entry then makes retries fail with 908. **Already fixed upstream** in
+   ROCm/clr@fa77aed ("clr: Fix stream capture invalidated state reset", 2026-05-30) —
+   but only on `develop`, in no release as of 7.2. Ask AMD for a 7.2.x backport instead
+   of filing anew. Our warp-side alloc guard stays regardless: it prevents the
+   *invalidation* itself, keeping the capture alive rather than merely failing cleanly.
+   Lesson: check clr `develop` before filing any of the items below.
 3. `hipStreamIsCapturing(NULL)` does not report the calling thread's capture the way
    CUDA's null-stream query does.
 4. `hipThreadExchangeStreamCaptureMode(Relaxed)` does not permit side-stream
