@@ -1034,6 +1034,11 @@ def _cluster_dim_target_status(device_arch: int | None, compile_arch: int | None
         so callers should raise instead of reasoning about clustering that is not
         present in the binary.
     """
+    # HIP devices report gfx architectures (as strings or gfx-numbered ints);
+    # thread block clusters are an NVIDIA sm90+ feature with no ROCm
+    # equivalent, so treat any non-sm arch as a sub-cluster device.
+    if isinstance(compile_arch, str) or isinstance(device_arch, str):
+        return "ignored"
     if compile_arch is not None and compile_arch >= 90:
         return "active"
     if device_arch is not None and device_arch < 90:

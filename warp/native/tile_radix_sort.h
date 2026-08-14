@@ -251,8 +251,10 @@ template <typename T> inline CUDA_CALLABLE wp::array_t<T> warp_shuffle_xor(wp::a
     result.shape = wp::warp_shuffle_xor(val.shape, lane_mask);
     for (int i = 0; i < wp::ARRAY_MAX_DIMS; ++i)
         result.strides[i] = __shfl_xor_sync((~wp_tile_mask_t(0)), val.strides[i], lane_mask);
-    result.ndim = static_cast<uint16_t>(__shfl_xor_sync((~wp_tile_mask_t(0)), static_cast<unsigned int>(val.ndim), lane_mask));
-    result.flags = static_cast<uint16_t>(__shfl_xor_sync((~wp_tile_mask_t(0)), static_cast<unsigned int>(val.flags), lane_mask));
+    result.ndim
+        = static_cast<uint16_t>(__shfl_xor_sync((~wp_tile_mask_t(0)), static_cast<unsigned int>(val.ndim), lane_mask));
+    result.flags
+        = static_cast<uint16_t>(__shfl_xor_sync((~wp_tile_mask_t(0)), static_cast<unsigned int>(val.flags), lane_mask));
 
     return result;
 }
@@ -1234,14 +1236,15 @@ template <typename TileK, typename TileV> CUDA_CALLABLE void tile_sort(TileK& t,
 #endif  // !defined(__CUDA_ARCH__)
 
 
-template <typename TileK, typename TileV> inline CUDA_CALLABLE void adj_tile_sort(TileK& t, TileV& t2, TileK& adj_t1, TileV& adj_t2)
+template <typename TileK, typename TileV>
+inline CUDA_CALLABLE void adj_tile_sort(TileK& t, TileV& t2, TileK& adj_t1, TileV& adj_t2)
 {
     // MISSINGADJOINT: track permutation indices in forward pass, apply inverse permutation to
     // adj outputs
 }
 
 template <typename TileK, typename TileV>
-inline void
+inline CUDA_CALLABLE void
 adj_tile_sort(TileK& t, TileV& t2, int start, int length, TileK& adj_t1, TileV& adj_t2, int adj_start, int adj_length)
 {
     // MISSINGADJOINT: track permutation indices in forward pass, apply inverse

@@ -874,20 +874,16 @@ void wp_free_device(void* context, void* ptr)
 // up front so the capture stays valid and can be ended normally.
 static bool hip_alloc_forbidden_during_capture()
 {
+    // Unlike CUDA, the thread's capture state is not queryable via the null
+    // stream on ROCm, so conservatively refuse whenever any capture is active
+    // in this process.
     if (g_captures.empty())
         return false;
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    // null stream: reports this thread's capture state under thread-local mode
-    ignore_cuda_error(cudaStreamIsCapturing(NULL, &status));
-    ignore_cuda_error(cudaGetLastError());
-    if (status != cudaStreamCaptureStatusNone) {
-        wp::set_error_string(
-            "Warp error: cannot allocate non-pooled memory during graph capture on HIP "
-            "(enable the memory pool or allocate before capture begins)"
-        );
-        return true;
-    }
-    return false;
+    wp::set_error_string(
+        "Warp error: cannot allocate non-pooled memory during graph capture on HIP "
+        "(enable the memory pool or allocate before capture begins)"
+    );
+    return true;
 }
 #endif  // defined(__HIP_PLATFORM_AMD__)
 
