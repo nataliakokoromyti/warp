@@ -99,3 +99,27 @@ portability-neutral fixes (see nvidia/warp PR #1702). Our five Warp fixes and fo
 fixes are all candidates — upstreaming them early keeps this branch small and rebaseable.
 The AMD port (and this branch) is ~430 commits behind nvidia/warp main; syncing that forward
 is a valuable, separable workstream.
+
+## Graph-replay investigation results (5-agent campaign, 2026-08-13)
+
+Diagnosis (rocprof, G1@256): graph replay dispatches identical kernels at identical speed as
+eager; the entire ~5 ms gap is IDLE inside hipGraphLaunch replay (~62%), concentrated at
+recurring positions — before captured fill/memset nodes and around large-dim/tiled kernels
+(which replay ~4x slower than eager). The graph carries mempool alloc/free nodes (proven via
+the one-exec-per-alloc-graph 801 restriction).
+
+Measured and ELIMINATED: newer ROCm user-space runtime (TheRock 7.14 nightly — zero delta);
+stream parallelism (branches verified present in graph — zero delta); node-count reduction
+(29% fewer nodes → 9% faster); env/launch knobs (GPU_MAX_HW_QUEUES etc. — noise); warm-capture
+pre-allocation (zero delta). Config-only best: euler integrator 8.3 ms graph; CG solver eager
+4.4 ms. Warp already instantiates with AutoFreeOnLaunch + hipGraphUpload.
+
+Practical guidance NOW: run eager on MI350X (4.4-4.8 ms/step @ 256 worlds; gap vanishes at
+8k+ worlds). Remaining unexplored levers, in order: (1) warp-side kernel-only capture —
+replace memset/copy (and ideally alloc) nodes with kernels during HIP capture, so the graph
+matches the fast synthetic case (1.7 us/node); (2) run the fixed split-graph sweep at
+/matx/u/knatalia/graphtune_agent/graphtune.py (~10 min job, was blocked by the 801 issue);
+(3) file a minimal repro with AMD — synthetic kernel-only graph replays at 1.7 us/node while
+real mixed-node graphs cost ~26 us/node; untested libamdhip64 knobs are listed in the gtune
+log. Full agent logs: /matx/u/knatalia/warp-rocm-logs/{prof_g1_16767817,node-sweep-16768261,
+gtune*-*,g1-streams-*,runtime-ab-*,isolate-16769579}.out.
