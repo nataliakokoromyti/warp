@@ -1,3 +1,108 @@
+diff --git a/mujoco_warp/_src/collision_driver.py b/mujoco_warp/_src/collision_driver.py
+index 8613fa8..196ef64 100644
+--- a/mujoco_warp/_src/collision_driver.py
++++ b/mujoco_warp/_src/collision_driver.py
+@@ -911,8 +911,13 @@ def collision(
+     d.nacon.zero_()
+     return
+ 
+-  # TODO(team): create context outside collision?
+-  ctx = create_collision_context(d.naconmax)
++  # Reuse the collision context across calls: per-call allocation puts
++  # memAlloc/memFree nodes into captured graphs. Contents are workspace
++  # (uninitialized, like wp.empty) and are rebuilt by broadphase each call.
++  ctx = getattr(d, "_collision_ctx", None)
++  if ctx is None or ctx.collision_worldid.shape[0] != d.naconmax:
++    ctx = create_collision_context(d.naconmax)
++    d._collision_ctx = ctx
+ 
+   incremental = awake_prev is not None
+ 
+diff --git a/mujoco_warp/_src/constraint.py b/mujoco_warp/_src/constraint.py
+index 6dd318a..4e5b599 100644
+--- a/mujoco_warp/_src/constraint.py
++++ b/mujoco_warp/_src/constraint.py
+@@ -28,6 +28,7 @@ from mujoco_warp._src.types import vec6
+ from mujoco_warp._src.types import vec11
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
+ 
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+ 
+@@ -4870,7 +4871,7 @@ def _add_surface_vel(is_pyramidal: bool):
+ def make_constraint(m: types.Model, d: types.Data):
+   """Creates constraint jacobians and other supporting data."""
+   newton = m.opt.solver == types.SolverType.NEWTON
+-  efc_nnz = wp.empty((d.nworld,), dtype=int)
++  efc_nnz = scratch_empty(d, "constraint.efc_nnz", (d.nworld,), int)
+ 
+   wp.launch(
+     _zero_constraint_counts,
+diff --git a/mujoco_warp/_src/derivative.py b/mujoco_warp/_src/derivative.py
+index 90c1d5e..5e75822 100644
+--- a/mujoco_warp/_src/derivative.py
++++ b/mujoco_warp/_src/derivative.py
+@@ -30,6 +30,7 @@ from mujoco_warp._src.types import IntegratorType
+ from mujoco_warp._src.types import Model
+ from mujoco_warp._src.types import vec10
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
+ 
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+ 
+@@ -1129,7 +1130,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
+     # TODO(team): only clear elements not set by _qderiv_actuator_passive
+     out.zero_()
+     if m.nu > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
+-      vel = wp.empty((d.nworld, m.nu), dtype=float)
++      vel = scratch_empty(d, "derivative.vel", (d.nworld, m.nu), float)
+       wp.launch(
+         _qderiv_actuator_passive_vel,
+         dim=(d.nworld, m.nu),
+diff --git a/mujoco_warp/_src/forward.py b/mujoco_warp/_src/forward.py
+index bae3c3d..3c027fd 100644
+--- a/mujoco_warp/_src/forward.py
++++ b/mujoco_warp/_src/forward.py
+@@ -46,6 +46,7 @@ from mujoco_warp._src.types import TrnType
+ from mujoco_warp._src.types import vec10
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
+ 
+ wp.set_module_options({"enable_backward": False})
+ 
+@@ -579,7 +580,7 @@ def _map_m2d(
+ def implicit(m: Model, d: Data):
+   """Integrates fully implicit in velocity."""
+   if m.opt.integrator == IntegratorType.IMPLICIT:
+-    qH_M = wp.empty(d.M.shape, dtype=float)
++    qH_M = scratch_empty(d, "forward.implicit.qH_M", d.M.shape, float)
+ 
+     # 1. Compute M - dt * qDeriv_smooth in M-structure
+     derivative.deriv_smooth_vel(m, d, qH_M)
+@@ -596,16 +597,16 @@ def implicit(m: Model, d: Data):
+     derivative.deriv_rne_vel(m, d, d.qLU, flg_subtract=True)
+ 
+     # 4. Factorize and solve: qacc = qLU \ Ma
+-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
++    qacc = scratch_empty(d, "forward.implicit.qacc", (d.nworld, m.nv), float)
+     smooth.factor_solve_lu(m, d, d.qLU, qacc, d.efc.Ma)
+     _advance(m, d, qacc)
+   elif ~(m.opt.disableflags | ~(DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER)):
+     # qDeriv is in M-structure; the scratch qLD matches d.qLD (per-block).
+-    qDeriv = wp.empty((d.nworld, m.nC), dtype=float)
+-    qLD = wp.empty_like(d.qLD)
+-    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
++    qDeriv = scratch_empty(d, "forward.implicit.qDeriv", (d.nworld, m.nC), float)
++    qLD = scratch_empty(d, "forward.implicit.qLD", d.qLD.shape, d.qLD.dtype)
++    qLDiagInv = scratch_empty(d, "forward.implicit.qLDiagInv", (d.nworld, m.nv), float)
+     derivative.deriv_smooth_vel(m, d, qDeriv)
+-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
++    qacc = scratch_empty(d, "forward.implicit.qacc", (d.nworld, m.nv), float)
+     smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
+     _advance(m, d, qacc)
+   else:
 diff --git a/mujoco_warp/_src/forward_test.py b/mujoco_warp/_src/forward_test.py
 index 476b2a8..a23a267 100644
 --- a/mujoco_warp/_src/forward_test.py
@@ -192,12 +297,229 @@ index 9d2c2d8..bb536de 100644
    def test_create_warp_texture(self):
      """Tests that create_warp_texture creates a valid texture."""
      mjm, mjd, m, d = test_data.fixture("ray.xml")
+diff --git a/mujoco_warp/_src/sensor.py b/mujoco_warp/_src/sensor.py
+index 6a2eb1d..297b1f4 100644
+--- a/mujoco_warp/_src/sensor.py
++++ b/mujoco_warp/_src/sensor.py
+@@ -49,6 +49,9 @@ from mujoco_warp._src.util_misc import inside_geom
+ from mujoco_warp._src.util_misc import poly_potential
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
++from mujoco_warp._src.warp_util import scratch_full
++from mujoco_warp._src.warp_util import scratch_zeros
+ 
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+ 
+@@ -813,12 +816,12 @@ def sensor_pos(m: Model, d: Data):
+     return
+ 
+   # rangefinder
+-  rangefinder_dist = wp.empty((d.nworld, m.nrangefinder), dtype=float)
++  rangefinder_dist = scratch_empty(d, "sensor.rangefinder_dist", (d.nworld, m.nrangefinder), float)
+   if m.sensor_rangefinder_adr.size > 0:
+-    rangefinder_pnt = wp.empty((d.nworld, m.nrangefinder), dtype=wp.vec3)
+-    rangefinder_vec = wp.empty((d.nworld, m.nrangefinder), dtype=wp.vec3)
+-    rangefinder_geomid = wp.empty((d.nworld, m.nrangefinder), dtype=int)
+-    rangefinder_normal = wp.empty((d.nworld, m.nrangefinder), dtype=wp.vec3)
++    rangefinder_pnt = scratch_empty(d, "sensor.rangefinder_pnt", (d.nworld, m.nrangefinder), wp.vec3)
++    rangefinder_vec = scratch_empty(d, "sensor.rangefinder_vec", (d.nworld, m.nrangefinder), wp.vec3)
++    rangefinder_geomid = scratch_empty(d, "sensor.rangefinder_geomid", (d.nworld, m.nrangefinder), int)
++    rangefinder_normal = scratch_empty(d, "sensor.rangefinder_normal", (d.nworld, m.nrangefinder), wp.vec3)
+ 
+     # get position and direction
+     wp.launch(
+@@ -849,7 +852,7 @@ def sensor_pos(m: Model, d: Data):
+     energy_vel(m, d)
+ 
+   # collision sensors (distance, normal, fromto)
+-  sensor_collision = wp.full((d.nworld, m.nsensorcollision, 8, 7), 1.0e32, dtype=float)
++  sensor_collision = scratch_full(d, "sensor.sensor_collision", (d.nworld, m.nsensorcollision, 8, 7), float, 1.0e32)
+   if m.nsensorcollision:
+     wp.launch(
+       _sensor_collision,
+@@ -2537,8 +2540,8 @@ def sensor_acc(m: Model, d: Data):
+     ],
+   )
+ 
+-  weld_geom_count = wp.zeros((d.nworld, m.nbody), dtype=int)
+-  weld_geom_list = wp.full((d.nworld, m.nbody, MJ_MAXCONPAIR), -1, dtype=int)
++  weld_geom_count = scratch_zeros(d, "sensor.weld_geom_count", (d.nworld, m.nbody), int)
++  weld_geom_list = scratch_full(d, "sensor.weld_geom_list", (d.nworld, m.nbody, MJ_MAXCONPAIR), int, -1)
+   wp.launch(
+     _preprocess_tactile_contacts,
+     dim=d.naconmax,
+@@ -2597,11 +2600,17 @@ def sensor_acc(m: Model, d: Data):
+     ],
+   )
+ 
+-  sensor_contact_nmatch = wp.empty((d.nworld, m.nsensorcontact), dtype=int)
+-  sensor_contact_matchid = wp.empty((d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), dtype=int)
+-  sensor_contact_direction = wp.empty((d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), dtype=float)
++  sensor_contact_nmatch = scratch_empty(d, "sensor.contact_nmatch", (d.nworld, m.nsensorcontact), int)
++  sensor_contact_matchid = scratch_empty(
++    d, "sensor.contact_matchid", (d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), int
++  )
++  sensor_contact_direction = scratch_empty(
++    d, "sensor.contact_direction", (d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), float
++  )
+   if m.nsensorcontact:
+-    sensor_contact_criteria = wp.empty((d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), dtype=float)
++    sensor_contact_criteria = scratch_empty(
++      d, "sensor.contact_criteria", (d.nworld, m.nsensorcontact, m.opt.contact_sensor_maxmatch), float
++    )
+     # TODO(team): fill_ operations in one kernel?
+     sensor_contact_nmatch.fill_(0)
+     sensor_contact_matchid.fill_(-1)
+diff --git a/mujoco_warp/_src/smooth.py b/mujoco_warp/_src/smooth.py
+index c2ec372..01890c8 100644
+--- a/mujoco_warp/_src/smooth.py
++++ b/mujoco_warp/_src/smooth.py
+@@ -39,6 +39,8 @@ from mujoco_warp._src.types import vec10
+ from mujoco_warp._src.types import vec11
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
++from mujoco_warp._src.warp_util import scratch_zeros
+ 
+ wp.set_module_options({"enable_backward": False})
+ 
+@@ -2125,7 +2127,7 @@ def tendon_bias(m: Model, d: Data, qfrc: wp.array2d[float]):
+     qfrc: Force.
+   """
+   # time derivative of tendon Jacobian
+-  ten_Jdot = wp.zeros((d.nworld, m.nJten), dtype=float)
++  ten_Jdot = scratch_zeros(d, "smooth.ten_Jdot", (d.nworld, m.nJten), float)
+   wp.launch(
+     _tendon_dot,
+     dim=(d.nworld, m.ntendon),
+@@ -2157,7 +2159,7 @@ def tendon_bias(m: Model, d: Data, qfrc: wp.array2d[float]):
+   )
+ 
+   # tendon bias force coefficients
+-  ten_bias_coef = wp.zeros((d.nworld, m.ntendon), dtype=float)
++  ten_bias_coef = scratch_zeros(d, "smooth.ten_bias_coef", (d.nworld, m.ntendon), float)
+   wp.launch(
+     _tendon_bias_coef,
+     dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz),
+@@ -2892,7 +2894,7 @@ def transmission(m: Model, d: Data):
+   and tendon transmissions.
+   """
+   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
+-  moment_nnz = wp.zeros((d.nworld,), dtype=int)
++  moment_nnz = scratch_zeros(d, "smooth.moment_nnz", (d.nworld,), int)
+ 
+   wp.launch(
+     _transmission,
+@@ -3614,7 +3616,7 @@ def subtree_vel(m: Model, d: Data):
+   Computes the linear momentum and angular momentum for each subtree, accumulating
+   contributions up the kinematic tree.
+   """
+-  subtree_bodyvel = wp.empty((d.nworld, m.nbody), dtype=wp.spatial_vector)
++  subtree_bodyvel = scratch_empty(d, "smooth.subtree_bodyvel", (d.nworld, m.nbody), wp.spatial_vector)
+ 
+   # bodywise quantities
+   wp.launch(
+diff --git a/mujoco_warp/_src/solver.py b/mujoco_warp/_src/solver.py
+index 2b2964b..4aec496 100644
+--- a/mujoco_warp/_src/solver.py
++++ b/mujoco_warp/_src/solver.py
+@@ -32,6 +32,7 @@ from mujoco_warp._src.types import InverseContext
+ from mujoco_warp._src.types import SolverContext
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_full
+ 
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+ 
+@@ -3726,10 +3727,29 @@ def solve(m: types.Model, d: types.Data):
+     wp.copy(d.qacc, d.qacc_smooth)
+     d.solver_niter.fill_(0)
+   else:
+-    ctx = _create_solver_context(m, d)
++    ctx = _cached_solver_context(m, d)
+     _solve(m, d, ctx)
+ 
+ 
++def _cached_solver_context(m: types.Model, d: types.Data) -> SolverContext:
++  """Reuse the solver context across solves on the same Data.
++
++  Allocating the context on every solve puts memAlloc/memFree nodes into
++  captured graphs. Buffers that _create_solver_context allocates with zeros
++  are re-zeroed on reuse; the rest are workspace and need no initialization.
++  """
++  key = (m.nv, m.nv_pad, d.njmax, int(m.opt.solver), _use_incremental(m))
++  cached = getattr(d, "_solver_ctx_cache", None)
++  if cached is None or cached[0] != key:
++    ctx = _create_solver_context(m, d)
++    d._solver_ctx_cache = (key, ctx)
++    return ctx
++  ctx = cached[1]
++  ctx.grad.zero_()
++  ctx.ls_exhausted.zero_()
++  return ctx
++
++
+ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
+   """Finds forces that satisfy constraints."""
+   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
+@@ -3758,7 +3778,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
+       block_dim=m.block_dim.solve_init_search_cg,
+     )
+ 
+-  nsolving = wp.full(shape=(1,), value=d.nworld, dtype=int)
++  nsolving = scratch_full(d, "solver.nsolving", (1,), int, d.nworld)
+   if m.opt.iterations != 0 and m.opt.graph_conditional:
+     # Note: the iteration kernel (indicated by while_body) is repeatedly launched
+     # as long as condition_iteration is not zero.
 diff --git a/mujoco_warp/_src/warp_util.py b/mujoco_warp/_src/warp_util.py
-index 55fe2cf..d6d7fe3 100644
+index 55fe2cf..36ab229 100644
 --- a/mujoco_warp/_src/warp_util.py
 +++ b/mujoco_warp/_src/warp_util.py
-@@ -143,7 +143,11 @@ def cache_kernel(func):
+@@ -141,9 +141,53 @@ def cache_kernel(func):
+   return wrapper
  
+ 
++def _scratch_array(d, key: str, shape, dtype):
++  """Return a per-Data cached scratch array, allocating on first use.
++
++  Temporary arrays allocated inside step() become memAlloc/memFree nodes in
++  captured graphs (mempool allocations), which replay slowly on some platforms.
++  Caching them on Data keeps captured step graphs kernel-only. Arrays are
++  reallocated if the requested shape changes; contents persist between calls.
++  """
++  cache = getattr(d, "_scratch_arrays", None)
++  if cache is None:
++    cache = {}
++    d._scratch_arrays = cache
++  if not isinstance(shape, tuple):
++    shape = (shape,)
++  arr = cache.get(key)
++  if arr is None or arr.shape != shape:
++    arr = wp.empty(shape, dtype=dtype)
++    cache[key] = arr
++  return arr
++
++
++def scratch_empty(d, key: str, shape, dtype):
++  """Cached equivalent of ``wp.empty``: contents are uninitialized."""
++  return _scratch_array(d, key, shape, dtype)
++
++
++def scratch_zeros(d, key: str, shape, dtype):
++  """Cached equivalent of ``wp.zeros``: zeroed on every call."""
++  arr = _scratch_array(d, key, shape, dtype)
++  arr.zero_()
++  return arr
++
++
++def scratch_full(d, key: str, shape, dtype, value):
++  """Cached equivalent of ``wp.full``: filled with ``value`` on every call."""
++  arr = _scratch_array(d, key, shape, dtype)
++  arr.fill_(value)
++  return arr
++
++
  def check_toolkit_driver():
    wp.init()
 -  if wp.get_device().is_cuda:
