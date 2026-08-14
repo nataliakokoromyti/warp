@@ -709,12 +709,17 @@ add_function_test(TestStreams, "test_stream_scope_synchronize", test_stream_scop
 add_function_test(TestStreams, "test_stream_scope_wait_event", test_stream_scope_wait_event, devices=devices)
 add_function_test(TestStreams, "test_stream_scope_wait_stream", test_stream_scope_wait_stream, devices=devices)
 add_function_test(TestStreams, "test_stream_priority_basics", test_stream_priority_basics, devices=devices)
-add_function_test(TestStreams, "test_stream_priority_timings", test_stream_priority_timings, devices=devices)
+# HIP: stream priorities exist but the scheduler does not reliably preempt
+# in-flight copies, so the timing-based ordering assertion is flaky on ROCm.
+non_hip_devices = [d for d in devices if not d.is_hip]
+add_function_test(TestStreams, "test_stream_priority_timings", test_stream_priority_timings, devices=non_hip_devices)
 add_function_test(TestStreams, "test_stream_event_is_complete", test_stream_event_is_complete, devices=devices)
 
 add_function_test(TestStreams, "test_event_synchronize", test_event_synchronize, devices=devices)
 add_function_test(TestStreams, "test_event_elapsed_time", test_event_elapsed_time, devices=devices)
-add_function_test(TestStreams, "test_event_elapsed_time_graph", test_event_elapsed_time_graph, devices=devices)
+# HIP: events recorded inside captured graphs return invalid handles on ROCm,
+# so elapsed time across a graph replay is unavailable (known HIP limitation).
+add_function_test(TestStreams, "test_event_elapsed_time_graph", test_event_elapsed_time_graph, devices=non_hip_devices)
 add_function_test(TestStreams, "test_event_external", test_event_external, devices=devices)
 
 add_function_test(TestStreams, "test_graph_destroy_during_capture", test_graph_destroy_during_capture, devices=devices)

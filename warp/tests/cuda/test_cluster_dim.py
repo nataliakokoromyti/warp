@@ -26,7 +26,11 @@ def get_cluster_compile_arch(device):
 
 def cluster_compile_devices():
     """CUDA test devices that can compile and run thread block clusters."""
-    return [d for d in get_cuda_test_devices() if d.arch >= 90 and get_cluster_compile_arch(d) is not None]
+    # HIP: gfx arch numbers (e.g. 950) satisfy `arch >= 90` but thread block
+    # clusters are an NVIDIA sm90+ feature with no ROCm equivalent.
+    return [
+        d for d in get_cuda_test_devices() if not d.is_hip and d.arch >= 90 and get_cluster_compile_arch(d) is not None
+    ]
 
 
 def set_cluster_compile_arch(test, device):

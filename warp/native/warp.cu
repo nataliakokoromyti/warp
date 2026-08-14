@@ -359,9 +359,9 @@ int cuda_init()
                 // hardware; hipArray/hipTexObject creation fails with
                 // hipErrorNotSupported there. RDNA GPUs report support.
                 g_devices[i].is_texture_supported = 0;
-                check_cu(cuDeviceGetAttribute_f(
-                    &g_devices[i].is_texture_supported, hipDeviceAttributeImageSupport, device
-                ));
+                check_cu(
+                    cuDeviceGetAttribute_f(&g_devices[i].is_texture_supported, hipDeviceAttributeImageSupport, device)
+                );
 #endif
 #if !defined(__HIP_PLATFORM_AMD__)
                 int major = 0;
@@ -646,8 +646,7 @@ static int free_deferred_allocs(void* context = NULL)
                         StreamInfo* alloc_si = get_stream_info(alloc_stream);
                         if (alloc_si && alloc_si->cached_event) {
                             check_cu(cuEventRecord_f(alloc_si->cached_event, alloc_stream));
-                            check_cu(cuStreamWaitEvent_f(free_stream, alloc_si->cached_event,
-                                                         CU_EVENT_WAIT_DEFAULT));
+                            check_cu(cuStreamWaitEvent_f(free_stream, alloc_si->cached_event, CU_EVENT_WAIT_DEFAULT));
                         }
                     }
                     g_alloc_streams.erase(alloc_it);
@@ -821,8 +820,16 @@ contains_any(HaystackIter haystack_begin, HaystackIter haystack_end, NeedleIter 
 }
 
 
+#if defined(__HIP_PLATFORM_AMD__)
+static bool hip_alloc_forbidden_during_capture();
+#endif
+
 void* wp_alloc_pinned(size_t s, const char* tag)
 {
+#if defined(__HIP_PLATFORM_AMD__)
+    if (hip_alloc_forbidden_during_capture())
+        return NULL;
+#endif
     void* ptr = NULL;
     check_cuda(cudaMallocHost(&ptr, s));
     if (g_alloc_tracker.enabled && ptr)
@@ -858,6 +865,32 @@ void wp_free_device(void* context, void* ptr)
         wp_free_device_default(context, ptr);
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+// On ROCm, calling hipMalloc/hipHostMalloc while this thread has an active
+// stream capture doesn't just fail like the CUDA equivalents: it INVALIDATES
+// the capture, and ROCm 7.2 cannot terminate an invalidated thread-local
+// capture (hipStreamEndCapture returns error 908), leaving the stream stuck
+// in capture state permanently. Detect the situation and fail the allocation
+// up front so the capture stays valid and can be ended normally.
+static bool hip_alloc_forbidden_during_capture()
+{
+    if (g_captures.empty())
+        return false;
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    // null stream: reports this thread's capture state under thread-local mode
+    ignore_cuda_error(cudaStreamIsCapturing(NULL, &status));
+    ignore_cuda_error(cudaGetLastError());
+    if (status != cudaStreamCaptureStatusNone) {
+        wp::set_error_string(
+            "Warp error: cannot allocate non-pooled memory during graph capture on HIP "
+            "(enable the memory pool or allocate before capture begins)"
+        );
+        return true;
+    }
+    return false;
+}
+#endif  // defined(__HIP_PLATFORM_AMD__)
+
 void* wp_alloc_device_default(void* context, size_t s, const char* tag)
 {
     ContextGuard guard(context);
@@ -867,6 +900,8 @@ void* wp_alloc_device_default(void* context, size_t s, const char* tag)
     // pointer that callers treat as a valid allocation (NVIDIA/warp PR #1702).
     if (s == 0)
         s = 1;
+    if (hip_alloc_forbidden_during_capture())
+        return NULL;
 #endif
     void* ptr = NULL;
     check_cuda(cudaMalloc(&ptr, s));
@@ -1038,8 +1073,7 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
                         StreamInfo* alloc_info = get_stream_info(alloc_stream);
                         if (alloc_info && alloc_info->cached_event) {
                             check_cu(cuEventRecord_f(alloc_info->cached_event, alloc_stream));
-                            check_cu(cuStreamWaitEvent_f(free_stream, alloc_info->cached_event,
-                                                         CU_EVENT_WAIT_DEFAULT));
+                            check_cu(cuStreamWaitEvent_f(free_stream, alloc_info->cached_event, CU_EVENT_WAIT_DEFAULT));
                         }
                     }
                     g_alloc_streams.erase(it);
@@ -1198,8 +1232,9 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
                             StreamInfo* alloc_si = get_stream_info(alloc_stream);
                             if (alloc_si && alloc_si->cached_event) {
                                 check_cu(cuEventRecord_f(alloc_si->cached_event, alloc_stream));
-                                check_cu(cuStreamWaitEvent_f(free_stream, alloc_si->cached_event,
-                                                             CU_EVENT_WAIT_DEFAULT));
+                                check_cu(
+                                    cuStreamWaitEvent_f(free_stream, alloc_si->cached_event, CU_EVENT_WAIT_DEFAULT)
+                                );
                             }
                         }
                         g_alloc_streams.erase(alloc_it);
@@ -1313,8 +1348,7 @@ template <typename T> static void launch_capture_copy(void* dst, const void* src
         return;
     const size_t num_threads = 256;
     const unsigned int num_blocks = static_cast<unsigned int>((n + num_threads - 1) / num_threads);
-    capture_copy_kernel<T>
-        <<<num_blocks, num_threads, 0, stream>>>(static_cast<T*>(dst), static_cast<const T*>(src), n);
+    capture_copy_kernel<T><<<num_blocks, num_threads, 0, stream>>>(static_cast<T*>(dst), static_cast<const T*>(src), n);
 }
 
 static bool memset_device_as_kernel(void* dest, int value, size_t n, cudaStream_t stream)
@@ -1454,8 +1488,12 @@ bool wp_memcpy_p2p(void* dst_context, void* dst, void* src_context, void* src, s
                 // check if either of the pointers was allocated from a mempool
                 void* src_mempool = NULL;
                 void* dst_mempool = NULL;
-                ignore_cu_result(cuPointerGetAttribute_f(&src_mempool, CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE, (CUdeviceptr)src));
-                ignore_cu_result(cuPointerGetAttribute_f(&dst_mempool, CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE, (CUdeviceptr)dst));
+                ignore_cu_result(
+                    cuPointerGetAttribute_f(&src_mempool, CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE, (CUdeviceptr)src)
+                );
+                ignore_cu_result(
+                    cuPointerGetAttribute_f(&dst_mempool, CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE, (CUdeviceptr)dst)
+                );
                 ignore_cuda_error(cudaGetLastError());  // clear any errors
                 // check if either of the pointers was allocated during graph capture
                 auto src_alloc = g_graph_allocs.find(src);
@@ -5017,11 +5055,11 @@ size_t wp_cuda_compile_program(
     // Match NVRTC default: strict IEEE 754 floating-point semantics.
     // These override the dangerous parts of -ffast-math while keeping
     // the transcendental substitutions from -fgpu-approx-transcendentals.
-    stored_options.push_back("-fno-finite-math-only");   // preserve inf/NaN
+    stored_options.push_back("-fno-finite-math-only");  // preserve inf/NaN
     opts.push_back(stored_options.back().c_str());
-    stored_options.push_back("-fno-associative-math");   // no reordering min/max chains
+    stored_options.push_back("-fno-associative-math");  // no reordering min/max chains
     opts.push_back(stored_options.back().c_str());
-    stored_options.push_back("-fno-reciprocal-math");    // no unsafe 1/x transforms
+    stored_options.push_back("-fno-reciprocal-math");  // no unsafe 1/x transforms
     opts.push_back(stored_options.back().c_str());
 
     // Match NVRTC default: safe pointer aliasing for reinterpret_casts
@@ -5064,11 +5102,9 @@ size_t wp_cuda_compile_program(
         const auto compile_end = std::chrono::steady_clock::now();
         const double compile_ms = std::chrono::duration<double, std::milli>(compile_end - compile_start).count();
         const std::string trace_path = std::string(output_path) + "_compile-time-trace.json";
-        const std::string trace = std::string("{\n")
-            + "  \"tool\": \"hiprtc\",\n"
+        const std::string trace = std::string("{\n") + "  \"tool\": \"hiprtc\",\n"
             + "  \"compile_ms\": " + std::to_string(compile_ms) + ",\n"
-            + "  \"result\": " + std::to_string(static_cast<int>(res)) + "\n"
-            + "}\n";
+            + "  \"result\": " + std::to_string(static_cast<int>(res)) + "\n" + "}\n";
         if (!write_file(trace.data(), trace.size(), trace_path, "wb")) {
             fprintf(stderr, "Warp warning: Failed to write HIPRTC compile_time_trace to '%s'\n", trace_path.c_str());
         }
@@ -5760,8 +5796,7 @@ void* wp_cuda_load_module(void* context, const char* path)
         if (!check_cu(cuModuleLoadDataEx_f(&module, input.data(), 0, NULL, NULL))) {
             fprintf(
                 stderr,
-                "Warp error: Failed to load HIP code object from '%s'. PTX is not supported on HIP; use HSACO.\n",
-                path
+                "Warp error: Failed to load HIP code object from '%s'. PTX is not supported on HIP; use HSACO.\n", path
             );
             return NULL;
         }
@@ -5941,7 +5976,8 @@ int wp_cuda_get_max_cluster_dim(void* context, void* kernel, int block_dim, int 
 #if defined(__HIP_PLATFORM_AMD__)
     // Thread-block clusters are a CUDA-only (Hopper+) feature. HIP/ROCm has no
     // equivalent launch-config plumbing, so report "no clusters supported".
-    (void)block_dim; (void)dynamic_smem_bytes;
+    (void)block_dim;
+    (void)dynamic_smem_bytes;
     return 1;
 #else
 

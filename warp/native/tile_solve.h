@@ -171,7 +171,7 @@ inline CUDA_CALLABLE void scalar_cholesky_solve(TileA& A, TileX& X, TileY& Y)
 
 
 template <typename Fwd, typename Bkwd, typename TileL, typename TileY, typename TileZ>
-TileZ& tile_lower_solve(Fwd fun_forward, Bkwd fun_bkwd, TileL& L, TileY& y, TileZ& z)
+inline CUDA_CALLABLE TileZ& tile_lower_solve(Fwd fun_forward, Bkwd fun_bkwd, TileL& L, TileY& y, TileZ& z)
 {
     // Copy y to z
     z = y;
@@ -319,7 +319,7 @@ void adj_tile_lower_solve_inplace(
 
 
 template <typename Fwd, typename TileU, typename TileZ, typename TileX>
-TileX& tile_upper_solve(Fwd fun_forward, TileU& U, TileZ& z, TileX& x)
+inline CUDA_CALLABLE TileX& tile_upper_solve(Fwd fun_forward, TileU& U, TileZ& z, TileX& x)
 {
     // Copy z to x
     x = z;
@@ -373,7 +373,7 @@ template <
     typename AdjTileZ,
     typename AdjTileX,
     typename AdjRet>
-void adj_tile_upper_solve(
+inline CUDA_CALLABLE void adj_tile_upper_solve(
     Fwd fun_forward,
     TileU& U,
     TileZ& z,
@@ -400,7 +400,7 @@ void adj_tile_upper_solve_inplace(
 
 
 template <bool Upper, typename Fwd, typename TileA, typename TileY, typename TileX>
-TileX& tile_cholesky_solve(Fwd fun_forward, TileA& A, TileY& Y, TileX& X)
+inline CUDA_CALLABLE TileX& tile_cholesky_solve(Fwd fun_forward, TileA& A, TileY& Y, TileX& X)
 {
     // Copy y to x
 
@@ -422,7 +422,7 @@ TileX& tile_cholesky_solve(Fwd fun_forward, TileA& A, TileY& Y, TileX& X)
 }
 
 template <bool Upper, typename Fwd, typename TileA, typename TileY>
-void tile_cholesky_solve_inplace(Fwd fun_forward, TileA& A, TileY& Y)
+inline CUDA_CALLABLE void tile_cholesky_solve_inplace(Fwd fun_forward, TileA& A, TileY& Y)
 {
 #if !defined(__CUDA_ARCH__) || WP_ENABLE_MATHDX == 0
     partitioned_gemm::scalar_cholesky_solve<Upper>(A, Y, Y);
@@ -448,7 +448,7 @@ template <
     typename AdjTileY,
     typename AdjTileX,
     typename AdjRet>
-void adj_tile_cholesky_solve(
+inline CUDA_CALLABLE void adj_tile_cholesky_solve(
     Fwd fun_forward,
     TileA& A,
     TileY& Y,
@@ -472,7 +472,7 @@ template <
     typename AdjFwd,
     typename AdjTileA,
     typename AdjTileY>
-void adj_tile_cholesky_solve_inplace(
+inline CUDA_CALLABLE void adj_tile_cholesky_solve_inplace(
     Fwd fun_forward, TileA& A, TileY& Y, AdjFwd adj_fun_forward, AdjTileA& adj_A, AdjTileY& adj_Y
 )
 {

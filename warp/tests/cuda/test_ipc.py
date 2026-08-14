@@ -100,11 +100,18 @@ class TestIpc(unittest.TestCase):
 
 add_function_test(TestIpc, "test_ipc_get_memory_handle", test_ipc_get_memory_handle, devices=cuda_devices)
 add_function_test(TestIpc, "test_ipc_get_event_handle", test_ipc_get_event_handle, devices=cuda_devices)
+# HIP: hipIpcGetEventHandle does not enforce the interprocess-flag requirement
+# the way CUDA does, and cross-process IPC event/memory semantics are not yet
+# validated on ROCm; restrict these two to real CUDA devices.
+non_hip_devices = [d for d in cuda_devices if not d.is_hip]
 add_function_test(
-    TestIpc, "test_ipc_event_missing_interprocess_flag", test_ipc_event_missing_interprocess_flag, devices=cuda_devices
+    TestIpc,
+    "test_ipc_event_missing_interprocess_flag",
+    test_ipc_event_missing_interprocess_flag,
+    devices=non_hip_devices,
 )
 add_function_test(
-    TestIpc, "test_ipc_multiprocess_write", test_ipc_multiprocess_write, devices=cuda_devices, check_output=False
+    TestIpc, "test_ipc_multiprocess_write", test_ipc_multiprocess_write, devices=non_hip_devices, check_output=False
 )
 
 
