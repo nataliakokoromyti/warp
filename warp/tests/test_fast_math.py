@@ -311,7 +311,14 @@ class TestFastMath(unittest.TestCase):
 
 devices = get_test_devices()
 
-add_function_test(TestFastMath, "test_fast_math_cuda", test_fast_math_cuda, devices=get_cuda_test_devices())
+# HIP: hipRTC's fast-math powf(-2, 2) returns 4.0 rather than NVIDIA's NaN --
+# the fast-math NaN contract is compiler-specific, so only assert it on CUDA.
+add_function_test(
+    TestFastMath,
+    "test_fast_math_cuda",
+    test_fast_math_cuda,
+    devices=[d for d in get_cuda_test_devices() if not d.is_hip],
+)
 add_function_test(TestFastMath, "test_fast_math_disabled", test_fast_math_disabled, devices=devices)
 add_function_test(TestFastMath, "test_approx_div_div", test_approx_div_div, devices=get_cuda_test_devices())
 add_function_test(TestFastMath, "test_approx_div_inverse", test_approx_div_inverse, devices=get_cuda_test_devices())
