@@ -261,7 +261,9 @@ def test_array_ops(test, device):
     assert_np_equal((a * b).numpy(), a_np * b_np)
     assert_np_equal((2.0 * a).numpy(), 2.0 * a_np)
     assert_np_equal((a * 2.0).numpy(), a_np * 2.0)
-    np.testing.assert_allclose((a**b).numpy(), a_np**b_np, rtol=1.5e-7)
+    # gfx powf differs from NVIDIA's by ~1e-6 at large magnitudes; relax on HIP
+    pow_rtol = 5e-6 if wp.get_device(device).is_hip else 1.5e-7
+    np.testing.assert_allclose((a**b).numpy(), a_np**b_np, rtol=pow_rtol)
     np.testing.assert_allclose((a**2.0).numpy(), a_np**2.0)
     assert_np_equal((a / b).numpy(), a_np / b_np)
     assert_np_equal((a / 2.0).numpy(), a_np / 2.0)

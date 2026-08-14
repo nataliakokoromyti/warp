@@ -160,6 +160,10 @@ class TestDevices(unittest.TestCase):
         # Validate the list contents (may be non-empty even without
         # CUDA devices when NVRTC is available without a driver)
         for arch in archs:
+            if isinstance(arch, str):
+                # HIP devices report gfx architecture strings (e.g. "gfx950:sramecc+:xnack-")
+                self.assertTrue(arch.startswith("gfx"), f"Architecture value {arch} should be an sm int or gfx string")
+                continue
             self.assertIsInstance(arch, int, f"Architecture value {arch} should be an integer")
             self.assertGreaterEqual(arch, 50, f"Architecture {arch} should be >= 50 (e.g., sm_50)")
             self.assertLessEqual(arch, 150, f"Architecture {arch} seems unreasonably high")

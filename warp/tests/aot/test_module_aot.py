@@ -343,6 +343,8 @@ class TestModuleAOT(unittest.TestCase):
             self.skipTest("NVRTC not available")
 
         arch = supported_archs[0]
+        if isinstance(arch, str):
+            self.skipTest("PTX output is not available on HIP (gfx architectures)")
 
         try:
             shutil.rmtree(TEST_CACHE_DIR, ignore_errors=True)

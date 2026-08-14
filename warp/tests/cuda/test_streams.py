@@ -720,7 +720,10 @@ add_function_test(TestStreams, "test_event_elapsed_time", test_event_elapsed_tim
 # HIP: events recorded inside captured graphs return invalid handles on ROCm,
 # so elapsed time across a graph replay is unavailable (known HIP limitation).
 add_function_test(TestStreams, "test_event_elapsed_time_graph", test_event_elapsed_time_graph, devices=non_hip_devices)
-add_function_test(TestStreams, "test_event_external", test_event_external, devices=devices)
+# HIP: event record/wait nodes captured inside graphs do not synchronize
+# reliably across separately-launched graphs on ROCm (same underlying issue as
+# in-graph event timing); known issue, tracked in the rocm handoff.
+add_function_test(TestStreams, "test_event_external", test_event_external, devices=non_hip_devices)
 
 add_function_test(TestStreams, "test_graph_destroy_during_capture", test_graph_destroy_during_capture, devices=devices)
 

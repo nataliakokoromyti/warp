@@ -163,6 +163,53 @@ __global__ void bvh_refit_kernel(
     }
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+// Bottom-up internal-node refit for the capture-safe HIP build path. Leaf
+// bounds were already written by build_leaves, whose pre-packing layout stores
+// position indices (not primitive ranges) in the leaf .i fields, so leaves
+// must not be recomputed here -- only internal nodes combine child bounds.
+__global__ void refit_internal_nodes_kernel(
+    int num_leaves,
+    const int* __restrict__ parents,
+    int* __restrict__ child_count,
+    BVHPackedNodeHalf* __restrict__ node_lowers,
+    BVHPackedNodeHalf* __restrict__ node_uppers
+)
+{
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+    if (index >= num_leaves)
+        return;
+
+    for (;;) {
+        int parent = parents[index];
+        if (parent == -1)
+            return;
+
+        // ensure this node's bounds are visible before the parent combines them
+        __threadfence();
+
+        int finished = atomicAdd(&child_count[parent], 1);
+        if (finished == 1) {
+            BVHPackedNodeHalf& parent_lower = node_lowers[parent];
+            BVHPackedNodeHalf& parent_upper = node_uppers[parent];
+            const int left_child = parent_lower.i;
+            const int right_child = parent_upper.i;
+
+            const vec3 lower = min((vec3&)(node_lowers[left_child]), (vec3&)(node_lowers[right_child]));
+            const vec3 upper = max((vec3&)(node_uppers[left_child]), (vec3&)(node_uppers[right_child]));
+
+            // vec3 writes touch only xyz, preserving the packed child index and leaf flag
+            (vec3&)parent_lower = lower;
+            (vec3&)parent_upper = upper;
+            index = parent;
+        } else {
+            // first child to arrive: parent not complete yet, terminate thread
+            return;
+        }
+    }
+}
+#endif  // defined(__HIP_PLATFORM_AMD__)
+
 // Create a linear BVH as described in Fast and Simple Agglomerative LBVH construction
 // this is a bottom-up clustering method that outputs one node per-leaf
 //
@@ -935,13 +982,12 @@ void LinearBVHBuilderGPU::build(
 
     if (capturing) {
         // Bottom-up atomic refit: capture-safe (no host readback). Leaves occupy
-        // node indices [0, num_items); internal nodes are reached via the parent
-        // walk inside the kernel.
+        // node indices [0, num_items) and already hold their bounds from
+        // build_leaves; internal nodes are combined via the parent walk.
         wp_memset_device(WP_CURRENT_CONTEXT, child_count, 0, sizeof(int) * bvh.max_nodes);
         wp_launch_device(
-            WP_CURRENT_CONTEXT, bvh_refit_kernel, num_items,
-            (num_items, bvh.node_parents, child_count, bvh.primitive_indices, bvh.node_lowers, bvh.node_uppers,
-             item_lowers, item_uppers)
+            WP_CURRENT_CONTEXT, refit_internal_nodes_kernel, num_items,
+            (num_items, bvh.node_parents, child_count, bvh.node_lowers, bvh.node_uppers)
         );
     } else {
         int max_depth = 0;

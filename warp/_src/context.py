@@ -13036,7 +13036,13 @@ def capture_save(graph: Graph, path: str, inputs: dict | None = None, outputs: d
             return s
         return s.encode("utf-8")
 
-    # Register module metadata with C++
+    # Register module metadata with C++.
+    # The serialized target arch is a uint32: CUDA SM version, the numeric part
+    # of a HIP gfx arch (parsed as hex, e.g. "gfx90a" -> 0x90a), or 0 for CPU.
+    target_arch = graph.device.get_cuda_compile_arch() if graph.device.is_cuda else 0
+    if isinstance(target_arch, str):
+        gfx_match = re.search(r"gfx([0-9a-fA-F]+)", target_arch)
+        target_arch = int(gfx_match.group(1), 16) if gfx_match else 0
     for module_hash, info in apic_capture.collected_modules.items():
         module_name = info["module_name"]
         binary_filename = info["binary_filename"]
@@ -13046,7 +13052,7 @@ def capture_save(graph: Graph, path: str, inputs: dict | None = None, outputs: d
             _enc(module_hash),
             _enc(module_name),
             _enc(binary_filename),
-            graph.device.get_cuda_compile_arch() if graph.device.is_cuda else 0,
+            target_arch,
         )
 
     # Register kernel metadata
@@ -13152,8 +13158,7 @@ def capture_save(graph: Graph, path: str, inputs: dict | None = None, outputs: d
         if not runtime.core.wp_apic_register_mesh(state, ctypes.c_uint64(mesh_id)):
             raise RuntimeError(f"APIC: failed to register mesh for capture_save. {runtime.get_error_string()}")
 
-    # Write .wrp file
-    target_arch = graph.device.get_cuda_compile_arch() if graph.device.is_cuda else 0
+    # Write .wrp file (target_arch already normalized to a uint32 above)
     context = graph.device.context if graph.device.is_cuda else None
     result = runtime.core.wp_apic_state_save(state, wrp_path.encode("utf-8"), target_arch, context)
     if not result:

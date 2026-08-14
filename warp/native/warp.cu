@@ -1349,6 +1349,9 @@ template <typename T> static void launch_capture_copy(void* dst, const void* src
 
 static bool memset_device_as_kernel(void* dest, int value, size_t n, cudaStream_t stream)
 {
+    // clear any stale sticky error so the post-launch check reports only errors
+    // from this launch (e.g. conditional-graph support probes leave 801 behind)
+    ignore_cuda_error(cudaGetLastError());
     const unsigned char byte = static_cast<unsigned char>(value);
     const size_t addr = reinterpret_cast<size_t>(dest);
     if (((addr | n) & 7) == 0)
@@ -1362,6 +1365,7 @@ static bool memset_device_as_kernel(void* dest, int value, size_t n, cudaStream_
 
 static bool memcpy_d2d_as_kernel(void* dst, const void* src, size_t n, cudaStream_t stream)
 {
+    ignore_cuda_error(cudaGetLastError());
     const size_t align = reinterpret_cast<size_t>(dst) | reinterpret_cast<size_t>(src) | n;
     if ((align & 15) == 0)
         launch_capture_copy<int4>(dst, src, n >> 4, stream);
