@@ -5067,6 +5067,11 @@ class Device:
             if warp.config.enable_mempools_at_init:
                 # enable if supported
                 self.is_mempool_enabled = self.is_mempool_supported
+            elif self.is_hip and self.is_mempool_supported:
+                # HIP/ROCm: enable mempool by default when supported (hipGraph
+                # requires the pool allocator for in-capture allocations).
+                # Validated on ROCm 7.2 (AMD-Ecosystem/warp PR #15).
+                self.is_mempool_enabled = True
             else:
                 # disable by default
                 self.is_mempool_enabled = False
@@ -5188,15 +5193,13 @@ class Device:
     def supports_graph_capture(self) -> bool:
         """A boolean indicating whether native graph capture is supported on this device.
 
-        Returns ``True`` for CPU (always recordable via APIC) and CUDA devices.
-        Returns ``False`` for HIP/ROCm devices: hipGraph is not yet mature in
-        Warp's runtime (mempool pointer remapping bugs, event timing inside
-        graphs, etc.), so :func:`capture_begin` / :class:`ScopedCapture` are
-        no-ops on HIP and :func:`capture_save` is unavailable for HIP-targeted
-        graphs.
+        Returns ``True`` for CPU (always recordable via APIC), CUDA, and HIP/ROCm
+        devices. HIP graph capture is validated on ROCm 7.2+ (memset/memtile/
+        device-to-device copies are captured as kernel nodes so replay avoids
+        slow blit nodes). Known HIP limitations: conditional graph nodes are
+        unsupported (see :func:`is_conditional_graph_supported`) and event
+        timing inside captured graphs is unreliable.
         """
-        if self.is_hip:
-            return False
         return True
 
     @property
@@ -8379,10 +8382,8 @@ def _is_graph_capture_allocation_supported(device: DeviceLike) -> bool:
     device = runtime.get_device(device)
     if device.is_cpu:
         return True
-    # HIP/ROCm does not support native CUDA graph capture (and therefore no
-    # capture-time allocation); see Device.supports_graph_capture.
-    if device.is_hip:
-        return False
+    # HIP, like CUDA, requires the pool allocator for capture-time allocation
+    # (hipMallocAsync nodes; see the graph alloc handling in warp.cu).
     return device.is_mempool_supported
 
 
@@ -12156,9 +12157,7 @@ def capture_begin(
     if stream is None:
         stream = device.stream
 
-    # HIP/ROCm graph capture is not yet mature (mempool pointer remapping bugs,
-    # event timing inside graphs, etc.). Disable until hipGraph stabilizes.
-    # See ``Device.supports_graph_capture`` -- callers (notably
+    # ``Device.supports_graph_capture`` -- callers (notably
     # :class:`ScopedCapture`) treat a ``False`` return as "capture disabled" and
     # skip the matching :func:`capture_end`.
     if not device.supports_graph_capture:
@@ -12937,12 +12936,10 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
 
     if graph is None:
         # ScopedCapture leaves ``graph=None`` when ``capture_begin`` returned
-        # False (currently only on HIP, where graph capture is unsupported;
-        # see ``Device.supports_graph_capture``).
+        # False (see ``Device.supports_graph_capture``).
         raise RuntimeError(
             "capture_launch() received graph=None: capture was not started. "
-            "On HIP/ROCm, native graph capture is unsupported "
-            "(Device.supports_graph_capture is False); guard call sites or "
+            "Check Device.supports_graph_capture, guard call sites, or "
             "filter test devices with get_graph_capture_test_devices()."
         )
 
