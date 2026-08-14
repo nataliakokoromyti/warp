@@ -21,7 +21,9 @@
 // the same translation unit, so use the reopen-namespace form here too. Both
 // forms make Warp's own `cub::` uses (BlockReduce, DeviceRadixSort) resolve to
 // hipcub, and reopening the namespace with duplicate using-directives is legal.
-namespace cub { using namespace hipcub; }
+namespace cub {
+using namespace hipcub;
+}
 #else
 #include <cub/cub.cuh>
 #include <cuda.h>
@@ -265,8 +267,8 @@ static __device__ __forceinline__ int delta_prefix(const uint64_t* __restrict__ 
 
 // Variant that accepts a pre-loaded key to avoid redundant global loads
 // when the same index is queried repeatedly (common in Karras construction).
-static __device__ __forceinline__ int delta_prefix_cached(
-    const uint64_t* __restrict__ keys, int n, uint64_t key_i, int i, int j)
+static __device__ __forceinline__ int
+delta_prefix_cached(const uint64_t* __restrict__ keys, int n, uint64_t key_i, int i, int j)
 {
     if (j < 0 || j >= n)
         return -1;
@@ -407,7 +409,8 @@ __global__ void refit_nodes_at_depth(
     int target_depth,
     const int* __restrict__ depths,
     BVHPackedNodeHalf* __restrict__ node_lowers,
-    BVHPackedNodeHalf* __restrict__ node_uppers)
+    BVHPackedNodeHalf* __restrict__ node_uppers
+)
 {
     int tid = blockDim.x * blockIdx.x + threadIdx.x;
     if (tid >= n_internal)
@@ -689,8 +692,12 @@ __global__ void compute_block_bounds(
 // Fused final reduction: block bounds -> total bounds + inverse edge lengths.
 // Eliminates the separate compute_total_inv_edges kernel launch.
 __global__ void reduce_block_bounds(
-    const vec3* block_lowers, const vec3* block_uppers, int num_blocks,
-    vec3* total_lower, vec3* total_upper, vec3* total_inv_edges
+    const vec3* block_lowers,
+    const vec3* block_uppers,
+    int num_blocks,
+    vec3* total_lower,
+    vec3* total_upper,
+    vec3* total_inv_edges
 )
 {
     typedef cub::BlockReduce<vec3, REDUCE_BLOCK_DIM> BlockReduce;
@@ -718,38 +725,38 @@ __global__ void reduce_block_bounds(
     }
 }
 #else
-    // Original CUDA version with atomic vec3 operations
-    __global__ void compute_total_bounds(
-        const vec3* item_lowers, const vec3* item_uppers, vec3* total_lower, vec3* total_upper, int num_items
-    )
-    {
-        typedef cub::BlockReduce<vec3, 256> BlockReduce;
+// Original CUDA version with atomic vec3 operations
+__global__ void compute_total_bounds(
+    const vec3* item_lowers, const vec3* item_uppers, vec3* total_lower, vec3* total_upper, int num_items
+)
+{
+    typedef cub::BlockReduce<vec3, 256> BlockReduce;
 
-        __shared__ typename BlockReduce::TempStorage temp_storage;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
 
-        const int blockStart = blockDim.x * blockIdx.x;
-        const int numValid = ::min(num_items - blockStart, blockDim.x);
+    const int blockStart = blockDim.x * blockIdx.x;
+    const int numValid = ::min(num_items - blockStart, blockDim.x);
 
-        const int tid = blockStart + threadIdx.x;
+    const int tid = blockStart + threadIdx.x;
 
-        if (tid < num_items) {
-            vec3 lower = item_lowers[tid];
-            vec3 upper = item_uppers[tid];
+    if (tid < num_items) {
+        vec3 lower = item_lowers[tid];
+        vec3 upper = item_uppers[tid];
 
-            vec3 block_upper = BlockReduce(temp_storage).Reduce(upper, Vec3Max, numValid);
+        vec3 block_upper = BlockReduce(temp_storage).Reduce(upper, Vec3Max, numValid);
 
-            // sync threads because second reduce uses same temp storage as first
-            __syncthreads();
+        // sync threads because second reduce uses same temp storage as first
+        __syncthreads();
 
-            vec3 block_lower = BlockReduce(temp_storage).Reduce(lower, Vec3Min, numValid);
+        vec3 block_lower = BlockReduce(temp_storage).Reduce(lower, Vec3Min, numValid);
 
-            if (threadIdx.x == 0) {
-                // write out block results, expanded by the radius
-                atomic_max(total_upper, block_upper);
-                atomic_min(total_lower, block_lower);
-            }
+        if (threadIdx.x == 0) {
+            // write out block results, expanded by the radius
+            atomic_max(total_upper, block_upper);
+            atomic_min(total_lower, block_lower);
         }
     }
+}
 #endif
 
 // compute inverse edge length, this is just done on the GPU to avoid a CPU->GPU sync point
@@ -808,43 +815,61 @@ void LinearBVHBuilderGPU::build(
     // Query radix-sort temp storage requirement so we can include it in the pool
     size_t sort_temp_bytes = 0;
     (void)cub::DeviceRadixSort::SortPairs(
-        nullptr, sort_temp_bytes,
-        (const uint64_t*)nullptr, (uint64_t*)nullptr,
-        (const int*)nullptr, (int*)nullptr,
+        nullptr, sort_temp_bytes, (const uint64_t*)nullptr, (uint64_t*)nullptr, (const int*)nullptr, (int*)nullptr,
         num_items, 0, sort_end_bit
     );
 
-    const size_t sz_indices     = align_up(sizeof(int) * num_items, ALIGN);
-    const size_t sz_keys        = align_up(sizeof(uint64_t) * num_items * 2, ALIGN);  // *2 for cub internal double-buffer
+    const size_t sz_indices = align_up(sizeof(int) * num_items, ALIGN);
+    const size_t sz_keys = align_up(sizeof(uint64_t) * num_items * 2, ALIGN);  // *2 for cub internal double-buffer
     const size_t sz_range_lefts = align_up(sizeof(int) * bvh.max_nodes, ALIGN);
-    const size_t sz_range_rights= align_up(sizeof(int) * bvh.max_nodes, ALIGN);
-    const size_t sz_num_children= align_up(sizeof(int) * bvh.max_nodes, ALIGN);  // reused as node_depths
+    const size_t sz_range_rights = align_up(sizeof(int) * bvh.max_nodes, ALIGN);
+    const size_t sz_num_children = align_up(sizeof(int) * bvh.max_nodes, ALIGN);  // reused as node_depths
     const size_t sz_total_lower = align_up(sizeof(vec3), ALIGN);
     const size_t sz_total_upper = align_up(sizeof(vec3), ALIGN);
-    const size_t sz_inv_edges   = align_up(sizeof(vec3), ALIGN);
-    const size_t sz_blk_lowers  = align_up(sizeof(vec3) * nb_bounds, ALIGN);
-    const size_t sz_blk_uppers  = align_up(sizeof(vec3) * nb_bounds, ALIGN);
-    const size_t sz_max_depth   = align_up(sizeof(int), ALIGN);
-    const size_t sz_sort_temp   = align_up(sort_temp_bytes, ALIGN);
+    const size_t sz_inv_edges = align_up(sizeof(vec3), ALIGN);
+    const size_t sz_blk_lowers = align_up(sizeof(vec3) * nb_bounds, ALIGN);
+    const size_t sz_blk_uppers = align_up(sizeof(vec3) * nb_bounds, ALIGN);
+    const size_t sz_max_depth = align_up(sizeof(int), ALIGN);
+    const size_t sz_child_count = align_up(sizeof(int) * bvh.max_nodes, ALIGN);  // capture-path refit counters
+    const size_t sz_sort_temp = align_up(sort_temp_bytes, ALIGN);
 
-    const size_t pool_bytes = sz_indices + sz_keys + sz_range_lefts + sz_range_rights + sz_num_children
-        + sz_total_lower + sz_total_upper + sz_inv_edges + sz_blk_lowers + sz_blk_uppers + sz_max_depth + sz_sort_temp;
+    const size_t pool_bytes = sz_indices + sz_keys + sz_range_lefts + sz_range_rights + sz_num_children + sz_total_lower
+        + sz_total_upper + sz_inv_edges + sz_blk_lowers + sz_blk_uppers + sz_max_depth + sz_child_count + sz_sort_temp;
 
     char* pool = (char*)wp_alloc_device(WP_CURRENT_CONTEXT, pool_bytes);
 
     char* ptr = pool;
-    int*      indices       = (int*)ptr;      ptr += sz_indices;
-    uint64_t* keys          = (uint64_t*)ptr; ptr += sz_keys;
-    int*      range_lefts   = (int*)ptr;      ptr += sz_range_lefts;
-    int*      range_rights  = (int*)ptr;      ptr += sz_range_rights;
-    int*      num_children  = (int*)ptr;      ptr += sz_num_children;
-    vec3*     total_lower   = (vec3*)ptr;     ptr += sz_total_lower;
-    vec3*     total_upper   = (vec3*)ptr;     ptr += sz_total_upper;
-    vec3*     total_inv_edges = (vec3*)ptr;   ptr += sz_inv_edges;
-    vec3*     block_lowers  = (vec3*)ptr;     ptr += sz_blk_lowers;
-    vec3*     block_uppers  = (vec3*)ptr;     ptr += sz_blk_uppers;
-    int*      max_depth_dev = (int*)ptr;      ptr += sz_max_depth;
-    void*     sort_temp     = (void*)ptr;     // ptr += sz_sort_temp;
+    int* indices = (int*)ptr;
+    ptr += sz_indices;
+    uint64_t* keys = (uint64_t*)ptr;
+    ptr += sz_keys;
+    int* range_lefts = (int*)ptr;
+    ptr += sz_range_lefts;
+    int* range_rights = (int*)ptr;
+    ptr += sz_range_rights;
+    int* num_children = (int*)ptr;
+    ptr += sz_num_children;
+    vec3* total_lower = (vec3*)ptr;
+    ptr += sz_total_lower;
+    vec3* total_upper = (vec3*)ptr;
+    ptr += sz_total_upper;
+    vec3* total_inv_edges = (vec3*)ptr;
+    ptr += sz_inv_edges;
+    vec3* block_lowers = (vec3*)ptr;
+    ptr += sz_blk_lowers;
+    vec3* block_uppers = (vec3*)ptr;
+    ptr += sz_blk_uppers;
+    int* max_depth_dev = (int*)ptr;
+    ptr += sz_max_depth;
+    int* child_count = (int*)ptr;
+    ptr += sz_child_count;
+    void* sort_temp = (void*)ptr;  // ptr += sz_sort_temp;
+
+    // The depth-level refit below reads max_depth back to the host, which cannot
+    // be captured in a graph (and the trailing context synchronize would
+    // invalidate the capture). Under capture, refit bottom-up with the atomic
+    // bvh_refit_kernel instead: one kernel, no host round-trip.
+    const bool capturing = wp_cuda_stream_is_capturing(wp_cuda_stream_get_current()) != 0;
 
     // COMPUTE TOTAL BOUNDS
     if (total_bounds) {
@@ -875,17 +900,14 @@ void LinearBVHBuilderGPU::build(
     // SORT: keys in-place, values from indices -> bvh.primitive_indices (eliminates D2D copy)
     hipStream_t stream = (hipStream_t)wp_cuda_stream_get_current();
     (void)cub::DeviceRadixSort::SortPairs(
-        sort_temp, sort_temp_bytes,
-        keys, keys,
-        indices, bvh.primitive_indices,
-        num_items, 0, sort_end_bit, stream
+        sort_temp, sort_temp_bytes, keys, keys, indices, bvh.primitive_indices, num_items, 0, sort_end_bit, stream
     );
 
     // BUILD TREE TOPOLOGY (Karras-style, deterministic)
     wp_launch_device(
         WP_CURRENT_CONTEXT, build_leaves, num_items,
-        (item_lowers, item_uppers, num_items, bvh.primitive_indices, range_lefts, range_rights,
-         bvh.node_lowers, bvh.node_uppers)
+        (item_lowers, item_uppers, num_items, bvh.primitive_indices, range_lefts, range_rights, bvh.node_lowers,
+         bvh.node_uppers)
     );
 
     wp_memset_device(WP_CURRENT_CONTEXT, bvh.node_parents, 0xFF, sizeof(int) * bvh.max_nodes);
@@ -911,13 +933,22 @@ void LinearBVHBuilderGPU::build(
         (bvh.max_nodes, bvh.node_parents, node_depths, max_depth_dev, 1024)
     );
 
-    {
+    if (capturing) {
+        // Bottom-up atomic refit: capture-safe (no host readback). Leaves occupy
+        // node indices [0, num_items); internal nodes are reached via the parent
+        // walk inside the kernel.
+        wp_memset_device(WP_CURRENT_CONTEXT, child_count, 0, sizeof(int) * bvh.max_nodes);
+        wp_launch_device(
+            WP_CURRENT_CONTEXT, bvh_refit_kernel, num_items,
+            (num_items, bvh.node_parents, child_count, bvh.primitive_indices, bvh.node_lowers, bvh.node_uppers,
+             item_lowers, item_uppers)
+        );
+    } else {
         int max_depth = 0;
         wp_memcpy_d2h(WP_CURRENT_CONTEXT, &max_depth, max_depth_dev, sizeof(int));
 
         const int num_internal = num_items - 1;
-        for (int d = max_depth; d >= 1; --d)
-        {
+        for (int d = max_depth; d >= 1; --d) {
             wp_launch_device(
                 WP_CURRENT_CONTEXT, refit_nodes_at_depth, num_internal,
                 (num_internal, num_items, d, node_depths, bvh.node_lowers, bvh.node_uppers)
@@ -933,117 +964,115 @@ void LinearBVHBuilderGPU::build(
          bvh.leaf_size, precomputed_depths)
     );
 
-    // CLEANUP – single sync + single free
-    (void)cuCtxSynchronize_f();
+    // CLEANUP – single sync + single free (synchronizing would invalidate an
+    // active capture; in-capture frees of pool allocations are deferred by the
+    // graph-alloc machinery in wp_free_device)
+    if (!capturing)
+        (void)cuCtxSynchronize_f();
     wp_free_device(WP_CURRENT_CONTEXT, pool);
 }
 #else
-    void LinearBVHBuilderGPU::build(
-        BVH& bvh,
-        const vec3* item_lowers,
-        const vec3* item_uppers,
-        int num_items,
-        bounds3* total_bounds,
-        int* item_groups
-    )
-    {
-        // allocate temporary memory used during building
-        indices = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * num_items * 2, "(native:bvh)");  // *2 for radix sort
-        keys = (uint64_t*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(uint64_t) * num_items * 2, "(native:bvh)");  // *2 for radix sort
-        deltas = (int*)wp_alloc_device(
-            WP_CURRENT_CONTEXT, sizeof(int) * num_items, "(native:bvh)"
-        );  // highest differentiating bit between keys for item i and i+1
-        range_lefts = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh.max_nodes, "(native:bvh)");
-        range_rights = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh.max_nodes, "(native:bvh)");
-        num_children = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh.max_nodes, "(native:bvh)");
+void LinearBVHBuilderGPU::build(
+    BVH& bvh, const vec3* item_lowers, const vec3* item_uppers, int num_items, bounds3* total_bounds, int* item_groups
+)
+{
+    // allocate temporary memory used during building
+    indices
+        = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * num_items * 2, "(native:bvh)");  // *2 for radix sort
+    keys = (uint64_t*)wp_alloc_device(
+        WP_CURRENT_CONTEXT, sizeof(uint64_t) * num_items * 2, "(native:bvh)"
+    );  // *2 for radix sort
+    deltas = (int*)wp_alloc_device(
+        WP_CURRENT_CONTEXT, sizeof(int) * num_items, "(native:bvh)"
+    );  // highest differentiating bit between keys for item i and i+1
+    range_lefts = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh.max_nodes, "(native:bvh)");
+    range_rights = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh.max_nodes, "(native:bvh)");
+    num_children = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh.max_nodes, "(native:bvh)");
 
-        // if total bounds supplied by the host then we just
-        // compute our edge length and upload it to the GPU directly
-        if (total_bounds) {
-            // calculate Morton codes
-            vec3 edges = (*total_bounds).edges();
-            edges += vec3(0.0001f);
+    // if total bounds supplied by the host then we just
+    // compute our edge length and upload it to the GPU directly
+    if (total_bounds) {
+        // calculate Morton codes
+        vec3 edges = (*total_bounds).edges();
+        edges += vec3(0.0001f);
 
-            vec3 inv_edges = vec3(1.0f / edges[0], 1.0f / edges[1], 1.0f / edges[2]);
+        vec3 inv_edges = vec3(1.0f / edges[0], 1.0f / edges[1], 1.0f / edges[2]);
 
-            wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_lower, &total_bounds->lower[0], sizeof(vec3));
-            wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_upper, &total_bounds->upper[0], sizeof(vec3));
-            wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_inv_edges, &inv_edges[0], sizeof(vec3));
-        } else {
-            // IEEE-754 bit patterns for ± FLT_MAX
-            constexpr int FLT_MAX_BITS = 0x7f7fffff;
-            constexpr int NEG_FLT_MAX_BITS = 0xff7fffff;
+        wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_lower, &total_bounds->lower[0], sizeof(vec3));
+        wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_upper, &total_bounds->upper[0], sizeof(vec3));
+        wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_inv_edges, &inv_edges[0], sizeof(vec3));
+    } else {
+        // IEEE-754 bit patterns for ± FLT_MAX
+        constexpr int FLT_MAX_BITS = 0x7f7fffff;
+        constexpr int NEG_FLT_MAX_BITS = 0xff7fffff;
 
-            // total_lower := ( +FLT_MAX, +FLT_MAX, +FLT_MAX )
-            wp_launch_device(
-                WP_CURRENT_CONTEXT, memset_kernel, sizeof(vec3) / 4, ((int*)total_lower, FLT_MAX_BITS, sizeof(vec3) / 4)
-            );
-
-            // total_upper := ( -FLT_MAX, -FLT_MAX, -FLT_MAX )
-            wp_launch_device(
-                WP_CURRENT_CONTEXT, memset_kernel, sizeof(vec3) / 4,
-                ((int*)total_upper, NEG_FLT_MAX_BITS, sizeof(vec3) / 4)
-            );
-
-            // compute the total bounds on the GPU (CUDA version with atomics)
-            wp_launch_device(
-                WP_CURRENT_CONTEXT, compute_total_bounds, num_items,
-                (item_lowers, item_uppers, total_lower, total_upper, num_items)
-            );
-
-            // compute the total edge length
-            wp_launch_device(
-                WP_CURRENT_CONTEXT, compute_total_inv_edges, 1, (total_lower, total_upper, total_inv_edges)
-            );
-        }
-
-        // assign 30-bit Morton code based on the centroid of each triangle and bounds for each leaf
+        // total_lower := ( +FLT_MAX, +FLT_MAX, +FLT_MAX )
         wp_launch_device(
-            WP_CURRENT_CONTEXT, compute_morton_codes, num_items,
-            (item_lowers, item_uppers, num_items, total_lower, total_inv_edges, indices, keys, item_groups)
+            WP_CURRENT_CONTEXT, memset_kernel, sizeof(vec3) / 4, ((int*)total_lower, FLT_MAX_BITS, sizeof(vec3) / 4)
         );
 
-        // sort items based on Morton key (note the 64-bit sort key includes group in upper 32 bits and morton code in
-        // lower 32 bits)
-        radix_sort_pairs_device(WP_CURRENT_CONTEXT, keys, indices, num_items);
-        wp_memcpy_d2d(WP_CURRENT_CONTEXT, bvh.primitive_indices, indices, sizeof(int) * num_items);
-
-        // calculate deltas between adjacent keys (kept for debugging, not required by Karras builder)
-        wp_launch_device(WP_CURRENT_CONTEXT, compute_key_deltas, num_items, (keys, deltas, num_items - 1));
-
-        // initialize leaf nodes
+        // total_upper := ( -FLT_MAX, -FLT_MAX, -FLT_MAX )
         wp_launch_device(
-            WP_CURRENT_CONTEXT, build_leaves, num_items,
-            (item_lowers, item_uppers, num_items, indices, range_lefts, range_rights, bvh.node_lowers, bvh.node_uppers)
+            WP_CURRENT_CONTEXT, memset_kernel, sizeof(vec3) / 4, ((int*)total_upper, NEG_FLT_MAX_BITS, sizeof(vec3) / 4)
         );
 
-        // Original CUDA version with atomics-based hierarchy builder
-        // reset children count, this is our atomic counter so we know when an internal node is complete
-        wp_memset_device(WP_CURRENT_CONTEXT, num_children, 0, sizeof(int) * bvh.max_nodes);
-
-        // build the tree and internal node bounds
+        // compute the total bounds on the GPU (CUDA version with atomics)
         wp_launch_device(
-            WP_CURRENT_CONTEXT, build_hierarchy, num_items,
-            (num_items, bvh.root, deltas, keys, num_children, bvh.primitive_indices, range_lefts, range_rights,
-             bvh.node_parents, bvh.node_lowers, bvh.node_uppers)
+            WP_CURRENT_CONTEXT, compute_total_bounds, num_items,
+            (item_lowers, item_uppers, total_lower, total_upper, num_items)
         );
 
-        wp_launch_device(
-            WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes,
-            (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, keys, bvh.node_lowers, bvh.node_uppers,
-             bvh.leaf_size, (const int*)nullptr)
-        );
-
-
-        // free temporary memory
-        wp_free_device(WP_CURRENT_CONTEXT, indices);
-        wp_free_device(WP_CURRENT_CONTEXT, keys);
-        wp_free_device(WP_CURRENT_CONTEXT, deltas);
-
-        wp_free_device(WP_CURRENT_CONTEXT, range_lefts);
-        wp_free_device(WP_CURRENT_CONTEXT, range_rights);
-        wp_free_device(WP_CURRENT_CONTEXT, num_children);
+        // compute the total edge length
+        wp_launch_device(WP_CURRENT_CONTEXT, compute_total_inv_edges, 1, (total_lower, total_upper, total_inv_edges));
     }
+
+    // assign 30-bit Morton code based on the centroid of each triangle and bounds for each leaf
+    wp_launch_device(
+        WP_CURRENT_CONTEXT, compute_morton_codes, num_items,
+        (item_lowers, item_uppers, num_items, total_lower, total_inv_edges, indices, keys, item_groups)
+    );
+
+    // sort items based on Morton key (note the 64-bit sort key includes group in upper 32 bits and morton code in
+    // lower 32 bits)
+    radix_sort_pairs_device(WP_CURRENT_CONTEXT, keys, indices, num_items);
+    wp_memcpy_d2d(WP_CURRENT_CONTEXT, bvh.primitive_indices, indices, sizeof(int) * num_items);
+
+    // calculate deltas between adjacent keys (kept for debugging, not required by Karras builder)
+    wp_launch_device(WP_CURRENT_CONTEXT, compute_key_deltas, num_items, (keys, deltas, num_items - 1));
+
+    // initialize leaf nodes
+    wp_launch_device(
+        WP_CURRENT_CONTEXT, build_leaves, num_items,
+        (item_lowers, item_uppers, num_items, indices, range_lefts, range_rights, bvh.node_lowers, bvh.node_uppers)
+    );
+
+    // Original CUDA version with atomics-based hierarchy builder
+    // reset children count, this is our atomic counter so we know when an internal node is complete
+    wp_memset_device(WP_CURRENT_CONTEXT, num_children, 0, sizeof(int) * bvh.max_nodes);
+
+    // build the tree and internal node bounds
+    wp_launch_device(
+        WP_CURRENT_CONTEXT, build_hierarchy, num_items,
+        (num_items, bvh.root, deltas, keys, num_children, bvh.primitive_indices, range_lefts, range_rights,
+         bvh.node_parents, bvh.node_lowers, bvh.node_uppers)
+    );
+
+    wp_launch_device(
+        WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes,
+        (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, keys, bvh.node_lowers, bvh.node_uppers,
+         bvh.leaf_size, (const int*)nullptr)
+    );
+
+
+    // free temporary memory
+    wp_free_device(WP_CURRENT_CONTEXT, indices);
+    wp_free_device(WP_CURRENT_CONTEXT, keys);
+    wp_free_device(WP_CURRENT_CONTEXT, deltas);
+
+    wp_free_device(WP_CURRENT_CONTEXT, range_lefts);
+    wp_free_device(WP_CURRENT_CONTEXT, range_rights);
+    wp_free_device(WP_CURRENT_CONTEXT, num_children);
+}
 #endif
 // buffer_size is the number of T, not the number of bytes
 template <typename T> T* make_device_buffer_of(void* context, T* host_buffer, size_t buffer_size)
