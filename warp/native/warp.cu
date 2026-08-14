@@ -1274,6 +1274,78 @@ bool wp_memcpy_d2h(void* context, void* dest, void* src, size_t n, void* stream)
     return result;
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+
+// ROCm graph replay stalls at fill/copy (blit) nodes: synthetic kernel-only graphs replay
+// at ~1.7 us/node while graphs mixing memset/memcpy nodes cost ~26 us/node on MI350X
+// (see rocm-tools/graph_overhead.py). While a stream is capturing, route memset/memtile
+// and device-to-device memcpy through these kernels so the captured graph contains only
+// kernel nodes. Eager (non-capturing) execution keeps using hipMemsetAsync/hipMemcpyAsync.
+
+template <typename T> __global__ void capture_fill_kernel(T* dst, T value, size_t n)
+{
+    size_t tid = static_cast<size_t>(blockDim.x) * static_cast<size_t>(blockIdx.x) + static_cast<size_t>(threadIdx.x);
+    if (tid < n) {
+        dst[tid] = value;
+    }
+}
+
+template <typename T> __global__ void capture_copy_kernel(T* dst, const T* src, size_t n)
+{
+    size_t tid = static_cast<size_t>(blockDim.x) * static_cast<size_t>(blockIdx.x) + static_cast<size_t>(threadIdx.x);
+    if (tid < n) {
+        dst[tid] = src[tid];
+    }
+}
+
+template <typename T> static void launch_capture_fill(void* dst, T value, size_t n, cudaStream_t stream)
+{
+    if (n == 0)
+        return;
+    const size_t num_threads = 256;
+    const unsigned int num_blocks = static_cast<unsigned int>((n + num_threads - 1) / num_threads);
+    capture_fill_kernel<T><<<num_blocks, num_threads, 0, stream>>>(static_cast<T*>(dst), value, n);
+}
+
+template <typename T> static void launch_capture_copy(void* dst, const void* src, size_t n, cudaStream_t stream)
+{
+    if (n == 0)
+        return;
+    const size_t num_threads = 256;
+    const unsigned int num_blocks = static_cast<unsigned int>((n + num_threads - 1) / num_threads);
+    capture_copy_kernel<T>
+        <<<num_blocks, num_threads, 0, stream>>>(static_cast<T*>(dst), static_cast<const T*>(src), n);
+}
+
+static bool memset_device_as_kernel(void* dest, int value, size_t n, cudaStream_t stream)
+{
+    const unsigned char byte = static_cast<unsigned char>(value);
+    const size_t addr = reinterpret_cast<size_t>(dest);
+    if (((addr | n) & 7) == 0)
+        launch_capture_fill<int64_t>(dest, static_cast<int64_t>(0x0101010101010101ULL * byte), n >> 3, stream);
+    else if (((addr | n) & 3) == 0)
+        launch_capture_fill<int32_t>(dest, static_cast<int32_t>(0x01010101U * byte), n >> 2, stream);
+    else
+        launch_capture_fill<int8_t>(dest, static_cast<int8_t>(byte), n, stream);
+    return check_cuda(cudaGetLastError());
+}
+
+static bool memcpy_d2d_as_kernel(void* dst, const void* src, size_t n, cudaStream_t stream)
+{
+    const size_t align = reinterpret_cast<size_t>(dst) | reinterpret_cast<size_t>(src) | n;
+    if ((align & 15) == 0)
+        launch_capture_copy<int4>(dst, src, n >> 4, stream);
+    else if ((align & 7) == 0)
+        launch_capture_copy<int64_t>(dst, src, n >> 3, stream);
+    else if ((align & 3) == 0)
+        launch_capture_copy<int32_t>(dst, src, n >> 2, stream);
+    else
+        launch_capture_copy<int8_t>(dst, src, n, stream);
+    return check_cuda(cudaGetLastError());
+}
+
+#endif  // defined(__HIP_PLATFORM_AMD__)
+
 bool wp_memcpy_d2d(void* context, void* dest, void* src, size_t n, void* stream)
 {
     ContextGuard guard(context);
@@ -1286,7 +1358,15 @@ bool wp_memcpy_d2d(void* context, void* dest, void* src, size_t n, void* stream)
 
     begin_cuda_range(WP_TIMING_MEMCPY, cuda_stream, context, "memcpy DtoD");
 
+#if defined(__HIP_PLATFORM_AMD__)
+    bool result;
+    if (wp_cuda_stream_is_capturing(cuda_stream))
+        result = memcpy_d2d_as_kernel(dest, src, n, cuda_stream);
+    else
+        result = check_cuda(cudaMemcpyAsync(dest, src, n, cudaMemcpyDeviceToDevice, cuda_stream));
+#else
     bool result = check_cuda(cudaMemcpyAsync(dest, src, n, cudaMemcpyDeviceToDevice, cuda_stream));
+#endif
 
     end_cuda_range(WP_TIMING_MEMCPY, cuda_stream);
 
@@ -1472,7 +1552,15 @@ bool wp_memset_device(void* context, void* dest, int value, size_t n, void* stre
 
     begin_cuda_range(WP_TIMING_MEMSET, cuda_stream, context, "memset");
 
+#if defined(__HIP_PLATFORM_AMD__)
+    bool result;
+    if (wp_cuda_stream_is_capturing(cuda_stream))
+        result = memset_device_as_kernel(dest, value, n, cuda_stream);
+    else
+        result = check_cuda(cudaMemsetAsync(dest, value, n, cuda_stream));
+#else
     bool result = check_cuda(cudaMemsetAsync(dest, value, n, cuda_stream));
+#endif
 
     end_cuda_range(WP_TIMING_MEMSET, cuda_stream);
 
