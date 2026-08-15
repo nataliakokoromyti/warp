@@ -18,6 +18,32 @@
 
 #include "tile.h"
 
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(WP_ENABLE_ROCWMMA)
+// AMD rocWMMA: header-only MFMA C++ API (ROCm 7.x+, gfx942+). Compiles under
+// both hipcc AOT and hipRTC JIT; probed via __has_include so toolchains
+// without the header quietly keep the scalar path.
+#if defined(__has_include)
+#if __has_include(<rocwmma/rocwmma.hpp>)
+#include <rocwmma/rocwmma.hpp>
+#define WP_ENABLE_ROCWMMA 1
+#endif
+#endif
+#endif
+
+#if defined(WP_ENABLE_ROCWMMA)
+namespace wp {
+namespace partitioned_gemm {
+// Map a unit-column-stride predicate to the rocWMMA data layout tag.
+template <bool RowMajor> struct rocwmma_layout_select {
+    using type = rocwmma::row_major;
+};
+template <> struct rocwmma_layout_select<false> {
+    using type = rocwmma::col_major;
+};
+}  // namespace partitioned_gemm
+}  // namespace wp
+#endif  // WP_ENABLE_ROCWMMA
+
 #ifdef __clang__
 // disable warnings related to C++17 extensions on CPU JIT builds
 #pragma clang diagnostic push
@@ -215,6 +241,74 @@ inline CUDA_CALLABLE void scalar_matmul(const StorageA& A, const StorageB& B, St
     // Whether boundary checks can be eliminated at compile time
     constexpr bool aligned_m = (M % BM == 0);
     constexpr bool aligned_n = (N % BN == 0);
+
+#if defined(WP_ENABLE_ROCWMMA)
+    // AMD rocWMMA fast path: MFMA_F32_16x16x4 for 16x16 FP32 tiles where each
+    // operand is contiguous in one dimension (row- or column-major views both
+    // occur in blocked Cholesky). Fills the role of the WP_ENABLE_MATHDX /
+    // cuBLASDx path on NVIDIA. Requires whole 64-thread wavefronts: rocWMMA
+    // ops are wavefront-collective, so wave 0 performs the MFMA while any
+    // additional waves skip and rejoin at the caller's tile synchronization.
+    if constexpr (
+        (WP_TILE_BLOCK_DIM % 64 == 0) && M == 16 && N == 16 && (K % 4) == 0 && (sa1 == 1 || sa0 == 1)
+        && (sb1 == 1 || sb0 == 1) && (sc1 == 1 || sc0 == 1) && is_same<ElemA, float>::value
+        && is_same<ElemB, float>::value && is_same<ElemC, float>::value
+    ) {
+        if (WP_TILE_THREAD_IDX < 64) {
+            // Per-operand layout: unit column stride = row_major (ld = row
+            // stride), unit row stride = col_major (ld = column stride).
+            // Element (i, k) of A sits at i*sa0 + k*sa1 either way, so the
+            // K-loop offsets below are layout-uniform.
+            using ALayout = typename rocwmma_layout_select<sa1 == 1>::type;
+            using BLayout = typename rocwmma_layout_select<sb1 == 1>::type;
+            constexpr int lda = (sa1 == 1) ? sa0 : sa1;
+            constexpr int ldb = (sb1 == 1) ? sb0 : sb1;
+            constexpr int ldc = (sc1 == 1) ? sc0 : sc1;
+            constexpr auto c_mem_layout = (sc1 == 1) ? rocwmma::mem_row_major : rocwmma::mem_col_major;
+
+            rocwmma::fragment<rocwmma::matrix_a, 16, 16, 4, float, ALayout> a_frag;
+            rocwmma::fragment<rocwmma::matrix_b, 16, 16, 4, float, BLayout> b_frag;
+            rocwmma::fragment<rocwmma::accumulator, 16, 16, 4, float> c_frag;
+            // C_out = alpha * A@B (+ beta * C_in when accumulating).
+            // Always start c_frag = 0 and accumulate A@B via mma_sync, applying
+            // alpha and beta element-wise AFTER the K-loop: pre-loading
+            // beta*C_in into c_frag would incorrectly scale it by alpha too.
+            rocwmma::fill_fragment(c_frag, 0.0f);
+            for (int k = 0; k < K; k += 4) {
+                rocwmma::load_matrix_sync(a_frag, a_ptr + k * sa1, lda);
+                rocwmma::load_matrix_sync(b_frag, b_ptr + k * sb0, ldb);
+                rocwmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+            T alpha_val = T(alpha);
+            if constexpr (!Accumulate) {
+                if (alpha_val != T(1)) {
+                    WP_PRAGMA_UNROLL
+                    for (int i = 0; i < (int)c_frag.num_elements; i++)
+                        c_frag.x[i] *= float(alpha_val);
+                }
+                rocwmma::store_matrix_sync(c_ptr, c_frag, ldc, c_mem_layout);
+            } else {
+                T beta_val = T(beta);
+                if (beta_val == T(0)) {
+                    if (alpha_val != T(1)) {
+                        WP_PRAGMA_UNROLL
+                        for (int i = 0; i < (int)c_frag.num_elements; i++)
+                            c_frag.x[i] *= float(alpha_val);
+                    }
+                    rocwmma::store_matrix_sync(c_ptr, c_frag, ldc, c_mem_layout);
+                } else {
+                    rocwmma::fragment<rocwmma::accumulator, 16, 16, 4, float> c_in_frag;
+                    rocwmma::load_matrix_sync(c_in_frag, c_ptr, ldc, c_mem_layout);
+                    WP_PRAGMA_UNROLL
+                    for (int i = 0; i < (int)c_frag.num_elements; i++)
+                        c_frag.x[i] = float(alpha_val) * c_frag.x[i] + float(beta_val) * c_in_frag.x[i];
+                    rocwmma::store_matrix_sync(c_ptr, c_frag, ldc, c_mem_layout);
+                }
+            }
+        }
+        return;
+    }
+#endif  // WP_ENABLE_ROCWMMA
 
     for (int t = WP_TILE_THREAD_IDX; t < num_blocks; t += WP_TILE_BLOCK_DIM) {
         const int block_i = t / blocks_n;
