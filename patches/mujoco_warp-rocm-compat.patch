@@ -1,3 +1,71 @@
+diff --git a/mujoco_warp/_src/collision_convex.py b/mujoco_warp/_src/collision_convex.py
+index 9383b51..1760e3f 100644
+--- a/mujoco_warp/_src/collision_convex.py
++++ b/mujoco_warp/_src/collision_convex.py
+@@ -167,12 +167,16 @@ def ccd_hfield_kernel_builder(
+   gjk_iterations: int,
+   epa_iterations: int,
+   geomgeomid: int,
++  block_dim: int,
+   warn_overflow: bool,
+ ):
+   """Kernel builder for heightfield CCD collisions (no multiccd args)."""
+ 
+-  # runs convex collision on a set of geom pairs to recover contact info
+-  @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
++  # runs convex collision on a set of geom pairs to recover contact info.
++  # This kernel runs full GJK/EPA per heightfield prism in a per-thread loop:
++  # cap registers via launch_bounds and use the tuned CCD block size, like
++  # ccd_kernel, or occupancy collapses (notably on wave64 AMD GPUs).
++  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(block_dim, _CCD_MIN_BLOCKS))
+   def ccd_hfield_kernel(
+     # Model:
+     opt_ccd_tolerance: wp.array[float],
+@@ -250,6 +254,7 @@ def ccd_hfield_kernel_builder(
+     # Data out:
+     overflow_out: wp.array[int],
+   ):
++    # tuned launch: block_dim + register-friendly launch_bounds (see builder)
+     collisionid = wp.tid()
+     if collisionid >= ncollision_in[0]:
+       return
+@@ -714,7 +719,14 @@ def ccd_hfield_kernel_builder(
+ 
+ 
+ _CCD_OVERSUBSCRIBE_WAVES = 2
++# Minimum resident blocks per SM/CU requested via launch_bounds. On HIP the
++# CCD kernels (full GJK/EPA in per-thread loops) are register-bound: requesting
++# 8 resident blocks caps VGPRs and forces heavy spilling, while min-blocks 1
++# lets the compiler keep the working set in registers (~30% faster heightfield
++# collision on gfx950). NVIDIA keeps the upstream value.
+ _CCD_MIN_BLOCKS = 8
++if any(getattr(_d, "is_hip", False) for _d in wp.get_cuda_devices()):
++  _CCD_MIN_BLOCKS = 1
+ 
+ 
+ @cache_kernel
+@@ -953,7 +965,7 @@ def ccd_kernel_builder(
+ 
+   # runs convex collision on a set of geom pairs to recover contact info (non-heightfield)
+   @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(block_dim, _CCD_MIN_BLOCKS))
+-  def ccd_kernel(
++  def ccd_kernel(  # tuned launch_bounds (hip-aware _CCD_MIN_BLOCKS)
+     # Model:
+     opt_ccd_tolerance: wp.array[float],
+     geom_type: wp.array[int],
+@@ -1246,8 +1258,11 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
+     count, geomgeomid = _pair_count(g1, g2)
+     if (g1 == GeomType.HFIELD or g2 == GeomType.HFIELD) and count:
+       wp.launch(
+-        ccd_hfield_kernel_builder(g1, g2, m.opt.ccd_iterations, epa_iterations, geomgeomid, bool(m.opt.warn_overflow)),
++        ccd_hfield_kernel_builder(
++          g1, g2, m.opt.ccd_iterations, epa_iterations, geomgeomid, m.block_dim.convex_ccd, bool(m.opt.warn_overflow)
++        ),
+         dim=d.naconmax,
++        block_dim=m.block_dim.convex_ccd,
+         inputs=[
+           m.opt.ccd_tolerance,
+           m.geom_type,
 diff --git a/mujoco_warp/_src/collision_driver.py b/mujoco_warp/_src/collision_driver.py
 index 8613fa8..196ef64 100644
 --- a/mujoco_warp/_src/collision_driver.py

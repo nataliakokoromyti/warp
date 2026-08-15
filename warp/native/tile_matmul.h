@@ -245,12 +245,15 @@ inline CUDA_CALLABLE void scalar_matmul(const StorageA& A, const StorageB& B, St
 #if defined(WP_ENABLE_ROCWMMA)
     // AMD rocWMMA fast path: MFMA_F32_16x16x4 for 16x16 FP32 tiles where each
     // operand is contiguous in one dimension (row- or column-major views both
-    // occur in blocked Cholesky). Fills the role of the WP_ENABLE_MATHDX /
-    // cuBLASDx path on NVIDIA. Requires whole 64-thread wavefronts: rocWMMA
-    // ops are wavefront-collective, so wave 0 performs the MFMA while any
-    // additional waves skip and rejoin at the caller's tile synchronization.
+    // occur in blocked Cholesky). Restricted to single-wavefront blocks:
+    // measured on gfx950 (mujoco_warp G1/franka, block_dim=128), running the
+    // MFMA on wave 0 while further waves idle LOSES ~10% to the cooperative
+    // scalar path -- at these tiny tiles the scalar GEMM's full-block
+    // parallelism wins, mirroring the scalar-vs-cuBLASDx crossover note at the
+    // top of this file. Matrix cores need larger tiles (or fused multi-tile
+    // kernels) to pay off; that remains future work.
     if constexpr (
-        (WP_TILE_BLOCK_DIM % 64 == 0) && M == 16 && N == 16 && (K % 4) == 0 && (sa1 == 1 || sa0 == 1)
+        (WP_TILE_BLOCK_DIM == 64) && M == 16 && N == 16 && (K % 4) == 0 && (sa1 == 1 || sa0 == 1)
         && (sb1 == 1 || sb0 == 1) && (sc1 == 1 || sc0 == 1) && is_same<ElemA, float>::value
         && is_same<ElemB, float>::value && is_same<ElemC, float>::value
     ) {
