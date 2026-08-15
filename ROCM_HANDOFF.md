@@ -116,7 +116,11 @@ world counts, near-identical mujoco_warp commits (ours ea8d067, theirs 70c4571):
 | unitree_g1_hfield | 8192 | 129,060 | 1,678,525 | 13.0× |
 
 Geomean gap **5.6×** against a much weaker card — i.e. the port has large software
-headroom, decomposing into three quantified causes:
+headroom. **Measurement caveat**: repeated sweeps on the shared node show ±10–15 %
+run-to-run variance on some scenes (g1_flat spanned 602k–723k across three identical-code
+runs; hfield is rock-stable at 129k; the G1@256 graph bench is stable at 1.62–1.63 ms).
+Single-sweep deltas below that band are not conclusive. The gap decomposes into three
+quantified causes:
 
 1. **No conditional graph nodes on HIP** (API absent in ROCm 7.2 *and* clr main): the
    captured solver runs its full fixed budget (10 iterations on G1/humanoid, 5 on franka)
@@ -131,10 +135,32 @@ headroom, decomposing into three quantified causes:
 
 vs our own 1.13 branch, 1.17 improved: franka +11 %, humanoid +12 %, G1 flat **+61 %**
 (450k → 723k). Render scenes are not comparable across branches (1.13 auto-disabled
-rendering; 1.17 really renders). Not yet running on 1.17: cloth family (known nconmax
-overflow, pre-existing) and aloha_pot + primitives (rc=1, needs triage). Raw data:
-`/matx/u/knatalia/warp-rocm-logs/bench-results-16809526.log` and the nightly JSONL files
-from google-deepmind.github.io/mujoco_warp/nightly.
+rendering; 1.17 really renders). Still not running on 1.17: cloth family (known nconmax
+overflow, pre-existing) and primitives (rc=1, needs triage); aloha_pot recovered in later
+sweeps (~400k steps/s, 6.3× behind NVIDIA). Raw data:
+`/matx/u/knatalia/warp-rocm-logs/bench-results-{16809526,16811065,16812544}.log` and the
+nightly JSONL files from google-deepmind.github.io/mujoco_warp/nightly.
+
+### Optimization round findings (2026-08-15)
+
+- **MFMA (rocWMMA) tile matmul restored but restricted to single-wave blocks**
+  (`tile_matmul.h`, gated `WP_TILE_BLOCK_DIM == 64`): at mujoco's 16×16 f32 tiles with
+  block_dim=128, MFMA-on-wave-0 showed **no benefit** over the cooperative scalar GEMM
+  (within node variance) — consistent with upstream's scalar-vs-cuBLASDx crossover note.
+  Matrix cores need larger tiles / fused multi-tile kernels to pay off on this workload.
+- **CCD kernel register tuning (compat patch)**: the heightfield CCD kernel launched at
+  warp's default 256 block with no launch_bounds → hipcc assumes 1024-thread blocks →
+  ≤64 VGPRs → spills. With true block size + `_CCD_MIN_BLOCKS=1` on HIP (min-blocks 8
+  re-strangles registers: 31 % WORSE), eager hfield collision improved **3.68 → 2.59 ms
+  (‑30 %)**. Bench-level hfield is unchanged because graph-mode steps are dominated by
+  fixed solver iterations — reinforcing conditional graph nodes as the top lever.
+- **Warp bug found**: the kernel cache hash does not cover the `launch_bounds` kernel
+  decorator argument — changing it silently reuses the old binary. Worth an upstream fix
+  (nvidia/warp); we hash-bust with source comments in the compat patch meanwhile.
+- **Intermittent watch**: two different single-test suite failures across runs
+  (`test_copy_i2c_...Graph...`, `test_implicit_fields`), both exact-value partial-write
+  signatures, each passing in other runs (suite is otherwise 8,294-green). Needs a
+  dedicated flake-hunt (run those classes ~50×) before trusting or chasing.
 
 ## Known issues on HIP (gated in tests, documented here)
 
