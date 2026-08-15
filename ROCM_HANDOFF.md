@@ -96,6 +96,46 @@ kernel-level gfx950 tuning (block sizes, occupancy); wave64 tile op tuning. The 
 cache is a strong upstream candidate for google-deepmind/mujoco_warp (CUDA graphs also
 carry alloc nodes); the kernel-only capture is AMD-specific (AMD-Ecosystem/warp).
 
+## Cross-vendor benchmark comparison (2026-08-14, rocm-117)
+
+MI350X (this port) vs mujoco_warp's published nightly numbers on an **RTX 6000 Ada**
+(48 GB workstation card — roughly 1/8th of MI350X's paper specs). Same scenes, same
+world counts, near-identical mujoco_warp commits (ours ea8d067, theirs 70c4571):
+
+| scene | worlds | MI350X steps/s | RTX 6000 Ada | NV/AMD |
+|---|---|---|---|---|
+| unitree_g1_hfield_render | 8192 | 60,132 | 172,200 | 2.9× |
+| three_humanoids | 8192 | 359,263 | 1,075,606 | 3.0× |
+| mug | 8192 | 150,055 | 467,650 | 3.1× |
+| unitree_g1_flat | 8192 | 722,944 | 2,524,705 | 3.5× |
+| myoarm | 8192 | 262,368 | 1,392,823 | 5.3× |
+| aloha_clutter | 2048 | 59,979 | 359,280 | 6.0× |
+| humanoid | 8192 | 687,727 | 5,664,908 | 8.2× |
+| franka_emika_panda | 32768 | 2,777,812 | 23,376,118 | 8.4× |
+| aloha_sdf | 8192 | 34,987 | 411,178 | 11.8× |
+| unitree_g1_hfield | 8192 | 129,060 | 1,678,525 | 13.0× |
+
+Geomean gap **5.6×** against a much weaker card — i.e. the port has large software
+headroom, decomposing into three quantified causes:
+
+1. **No conditional graph nodes on HIP** (API absent in ROCm 7.2 *and* clr main): the
+   captured solver runs its full fixed budget (10 iterations on G1/humanoid, 5 on franka)
+   while NVIDIA's `capture_while` exits at convergence (their measured niter_mean:
+   G1 3.0, humanoid 1.4, franka 1.0). With solve at 21–52 % of NVIDIA's step time, this
+   alone costs ~2× on G1 and ~3.8× on humanoid. This is the single strongest ask to AMD:
+   conditional node support, with these numbers as justification.
+2. **Scalar tile math** (no MFMA/rocWMMA) — multiplies the per-iteration solver cost.
+3. **Collision kernels untuned for gfx950/wave64** — the two worst scenes (hfield 13×,
+   sdf 11.8×) are collision-dominated, pointing at heightfield-CCD and SDF evaluation
+   kernels as specific tuning targets.
+
+vs our own 1.13 branch, 1.17 improved: franka +11 %, humanoid +12 %, G1 flat **+61 %**
+(450k → 723k). Render scenes are not comparable across branches (1.13 auto-disabled
+rendering; 1.17 really renders). Not yet running on 1.17: cloth family (known nconmax
+overflow, pre-existing) and aloha_pot + primitives (rc=1, needs triage). Raw data:
+`/matx/u/knatalia/warp-rocm-logs/bench-results-16809526.log` and the nightly JSONL files
+from google-deepmind.github.io/mujoco_warp/nightly.
+
 ## Known issues on HIP (gated in tests, documented here)
 
 - **Deterministic mode is not ported**: warp 1.17's deterministic subsystem (phase-0
