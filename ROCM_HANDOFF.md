@@ -187,6 +187,27 @@ collision-heavy scenes (sdf, hfield, clutter) and small-`nv` solver scenes (fran
 humanoid nv=27, pot) where NVIDIA's conditional-node early exit means it runs ~1-3 solver
 iterations to our fixed 10.
 
+### Quantified: what conditional graph nodes are actually worth (2026-08-17)
+
+Capping `m.opt.iterations` bounds what a working early exit would buy, because the HIP path
+unrolls the full budget into the graph while NVIDIA exits at convergence. Measured
+warm-graph, MI350X (`rocm-tools/iter_ceiling.py`):
+
+| scene | scene's configured iterations | measured `niter_mean` | default | iterations=1 | **ceiling** |
+|---|---|---|---|---|---|
+| franka_emika_panda | **100** | 1.00 | 6.479 ms | 1.530 ms | **4.24x** |
+| humanoid | **100** | 1.00 | 4.767 ms | 1.409 ms | **3.38x** |
+| unitree_g1_flat | 10 | 1.00 | 5.297 ms | 4.650 ms | 1.14x |
+
+The franka and humanoid benchmark scenes configure a budget of **100 solver iterations and
+converge in 1** — so on HIP we replay ~99 iterations of dead work every step, while CUDA's
+conditional node skips them for free. That is 4.24x and 3.38x left on the table, and it
+lines up almost exactly with those scenes' 4.37x and 3.92x gaps vs the L40S in the table
+above. **This is the strongest possible evidence for prioritizing hipGraph conditional
+node support with AMD**, and it also bounds any home-grown workaround (a host-side
+chunked-solver stepper: launch K iterations, read `nsolving`, repeat — costs 1-2 syncs per
+step, which is <1% of a 6.5 ms step).
+
 **Corrected long-standing issue**: the cloth family (`cloth`, `cloth_render`,
 `aloha_cloth`) overflows on the **L40S too** (22/31/31 worlds vs our 26/29/29) with the
 same assets and settings. The old handoff item claiming AMD uniquely needs `nconmax~26000`
@@ -203,8 +224,12 @@ Where the remaining gap actually lives, now that allocation noise is gone:
 2. **Collision-dominated scenes.** `aloha_sdf` (12.2x) and `unitree_g1_hfield` (10.4x)
    barely improved from warm capture -- their cost is collision compute, not allocation.
    These are the top targets for our own optimization work.
-3. Residual warm-graph allocations: hfield still captures 7 memAlloc + 7 memFree even warm
-   (flat captures none). Worth hoisting those too.
+3. ~~Residual warm-graph allocations on hfield~~ — **fixed 2026-08-17**: traced to 7 real
+   allocations in `convex_narrowphase` (the EPA polytope scratch + ccd counter, sized from
+   `naccdmax`; 11 further calls are zero-sized and allocate nothing). Hoisted into the
+   `Data` scratch cache, so the hfield warm graph is now **291 nodes, 100% kernel, zero
+   memAlloc** and 15% faster (7.08 -> 5.99 ms; 1.16M -> 1.37M steps/s). These fired on the
+   L40S too, so it is an upstream mujoco_warp win, not an AMD workaround.
 
 **Refuted -- do not retry without new evidence:** wave-aware block sizing. mujoco_warp
 derives solver widths as `clamp(round_up_32(nv), 32, 256)` and keeps eight static 32-wide
