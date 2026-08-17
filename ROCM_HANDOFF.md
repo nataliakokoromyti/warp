@@ -1,7 +1,7 @@
 # Warp + mujoco_warp on MI350X — collaborator handoff
 
 *Goal: make Warp (and by extension mujoco_warp) fully validated and **super optimized** on
-AMD Instinct MI350X (gfx950). Status as of 2026-08-14.*
+AMD Instinct MI350X (gfx950). Status as of 2026-08-17.*
 
 ## What this branch is
 
@@ -21,11 +21,11 @@ HIP graph-capture PR #15 + our fixes; fully validated but frozen. Full backgroun
   **including all render tests**: CDNA software-sampled texture fallback works, where the
   1.13 branch disabled rendering entirely. (Needs `patches/mujoco_warp-rocm-compat.patch`.)
 - **G1@256 graph replay: 1.63 ms/step warm-capture** vs 5.2 eager — graphs are a 3.2×
-  speedup (on the 1.13 branch: 2.94 graph / 4.2 eager). Captured step graph remains 288
-  nodes, 100% kernel nodes. **Eager regressed** vs 1.13 (4.2 → 5.2 ms) — likely the new
-  base's scalar-only tile path (rocWMMA was dropped in AMD's re-port); see perf levers.
-- Benchmarks beyond G1 not yet re-run on 1.17 (`mjw_bench.sbatch`); 1.13 numbers for
-  reference: franka 2.50M steps/s (32k worlds), humanoid 614k, unitree_g1_flat 450k.
+  speedup (on the 1.13 branch: 2.94 graph / 4.2 eager). Captured step graph is 288 nodes,
+  100% kernel nodes.
+- **Full benchmark suite re-run on 1.17 with warm capture** (2026-08-17): g1_flat 1.51M
+  steps/s, franka 5.08M, humanoid 1.40M — see the cross-vendor section for the full table
+  and for why the previously reported gaps were mostly a cold-capture artifact.
 
 ## Our fixes (each upstreamable; see git log)
 
@@ -90,88 +90,79 @@ scratch allocations *inside* the capture and re-inherits the alloc nodes (hence 
 `rocm-tools/alloc_trace.py` verifies zero allocations fire during a warm capture.
 Validated: full mujoco_warp suite green with both fixes (1,233 passed / 0 failed).
 
-Remaining perf levers: **restore a matrix-core (rocWMMA/MFMA) tile path on the 1.17 base**
-(AMD's re-port is scalar-only, the likely cause of the eager regression 4.2 → 5.2 ms);
-kernel-level gfx950 tuning (block sizes, occupancy); wave64 tile op tuning. The scratch
-cache is a strong upstream candidate for google-deepmind/mujoco_warp (CUDA graphs also
-carry alloc nodes); the kernel-only capture is AMD-specific (AMD-Ecosystem/warp).
+Remaining perf levers, in evidence order (see the cross-vendor section for the data):
+**(1) conditional graph nodes** — AMD-blocked, worth ~2-4× on solver-heavy scenes since we
+replay a fixed 10 solver iterations where NVIDIA exits at ~3; **(2) collision kernels** —
+`aloha_sdf` and `unitree_g1_hfield` are the only scenes warm capture did not help, so their
+cost is collision compute; **(3) the 7 residual warm-graph allocations** on hfield.
+Already tried and refuted, with data: MFMA/rocWMMA tile matmul (no gain at mujoco's 16x16
+tiles) and wave-aware block sizing (slower). The scratch cache is a strong upstream
+candidate for google-deepmind/mujoco_warp (CUDA graphs carry the same alloc nodes — 34 of
+them on the L40S run — it simply costs CUDA far less); the kernel-only capture and the
+warm-capture harness fix are both broadly useful.
 
-## Cross-vendor benchmark comparison (2026-08-14, rocm-117)
+## Cross-vendor benchmark comparison (updated 2026-08-17, rocm-117)
 
-MI350X (this port) vs mujoco_warp's published nightly numbers on an **RTX 6000 Ada**
-(48 GB workstation card — roughly 1/8th of MI350X's paper specs). Same scenes, same
-world counts, near-identical mujoco_warp commits (ours ea8d067, theirs 70c4571):
+**Headline: most of the reported gap was benchmark methodology, not silicon.**
+`mjwarp-testspeed` captured its graph **cold** (on a `Data` that had never stepped), so all
+per-step scratch allocations became `memAlloc` nodes replayed on every launch. CUDA absorbs
+that almost for free; ROCm does not. Measured on the same scene, same worlds, by us:
 
-| scene | worlds | MI350X steps/s | RTX 6000 Ada | NV/AMD |
+| g1_flat @8192 | MI350X (rocm-117) | L40S (stock warp 1.16, pristine mjw) |
+|---|---|---|
+| eager | 5.56 ms | 6.11 ms |
+| cold-captured graph | 11.21 ms | 3.98 ms |
+| warm-captured graph | 5.09 ms | 3.76 ms |
+| **cold/warm penalty** | **2.20x** | **1.06x** |
+
+Node census proves the mechanism: our cold graph = 288 kernel + **34 memAlloc** nodes; our
+warm graph = 288 kernel, **zero** alloc nodes. So **graph-captured allocation nodes cost
+CUDA ~6% and ROCm ~120%** -- the single most quotable number for AMD (see bug list below).
+
+Fixing capture warmth (3 warmup steps before capture, now in the compat patch's
+`cli.unroll`) moves the whole suite:
+
+| scene | cold sweep | **warm sweep** | gain | gap vs NVIDIA (cold -> warm) |
 |---|---|---|---|---|
-| unitree_g1_hfield_render | 8192 | 60,132 | 172,200 | 2.9× |
-| three_humanoids | 8192 | 359,263 | 1,075,606 | 3.0× |
-| mug | 8192 | 150,055 | 467,650 | 3.1× |
-| unitree_g1_flat | 8192 | 722,944 | 2,524,705 | 3.5× |
-| myoarm | 8192 | 262,368 | 1,392,823 | 5.3× |
-| aloha_clutter | 2048 | 59,979 | 359,280 | 6.0× |
-| humanoid | 8192 | 687,727 | 5,664,908 | 8.2× |
-| franka_emika_panda | 32768 | 2,777,812 | 23,376,118 | 8.4× |
-| aloha_sdf | 8192 | 34,987 | 411,178 | 11.8× |
-| unitree_g1_hfield | 8192 | 129,060 | 1,678,525 | 13.0× |
+| unitree_g1_flat | 601,815 | **1,507,513** | 2.50x | 4.2x -> **1.7x** |
+| franka_emika_panda | 2,409,265 | **5,077,361** | 2.11x | 9.7x -> 4.6x |
+| humanoid | 700,167 | **1,397,633** | 2.00x | 8.1x -> 4.1x |
+| aloha_pot | 399,953 | 605,147 | 1.51x | 6.3x -> 4.2x |
+| myoarm | 260,747 | 373,955 | 1.43x | 5.3x -> 3.7x |
+| three_humanoids | 356,869 | 502,256 | 1.41x | 3.0x -> 2.1x |
+| unitree_g1_hfield | 129,374 | 161,122 | 1.25x | 13.0x -> 10.4x |
+| aloha_clutter | 59,213 | 68,987 | 1.17x | 6.1x -> 5.2x |
+| mug | 148,861 | 155,746 | 1.05x | 3.1x -> 3.0x |
+| aloha_sdf | 32,839 | 33,623 | 1.02x | 12.5x -> 12.2x |
+| unitree_g1_hfield_render | 59,910 | 60,850 | 1.02x | 2.9x -> 2.8x |
 
-Geomean gap **5.6×** against a much weaker card — i.e. the port has large software
-headroom. **Measurement caveat**: repeated sweeps on the shared node show ±10–15 %
-run-to-run variance on some scenes (g1_flat spanned 602k–723k across three identical-code
-runs; hfield is rock-stable at 129k; the G1@256 graph bench is stable at 1.62–1.63 ms).
-Single-sweep deltas below that band are not conclusive. The gap decomposes into three
-quantified causes:
+Geomean **1.43x** throughput from the warmth fix alone; gap vs the published NVIDIA
+dashboard falls 5.89x -> 4.12x geomean. Against our *own* L40S measurement (same scene,
+warm both sides) g1_flat is **1.35-1.44x**, i.e. the same ~1.7x ballpark as the eager
+comparison. NVIDIA's published numbers come from an RTX 6000 Ada -- same Ada generation as
+our L40S -- and their harness is cold too, which costs them almost nothing.
 
-1. **No conditional graph nodes on HIP** (API absent in ROCm 7.2 *and* clr main): the
-   captured solver runs its full fixed budget (10 iterations on G1/humanoid, 5 on franka)
-   while NVIDIA's `capture_while` exits at convergence (their measured niter_mean:
-   G1 3.0, humanoid 1.4, franka 1.0). With solve at 21–52 % of NVIDIA's step time, this
-   alone costs ~2× on G1 and ~3.8× on humanoid. This is the single strongest ask to AMD:
-   conditional node support, with these numbers as justification.
-2. **Scalar tile math** (no MFMA/rocWMMA) — multiplies the per-iteration solver cost.
-3. **Collision kernels untuned for gfx950/wave64** — the two worst scenes (hfield 13×,
-   sdf 11.8×) are collision-dominated, pointing at heightfield-CCD and SDF evaluation
-   kernels as specific tuning targets.
+Where the remaining gap actually lives, now that allocation noise is gone:
 
-vs our own 1.13 branch, 1.17 improved: franka +11 %, humanoid +12 %, G1 flat **+61 %**
-(450k → 723k). Render scenes are not comparable across branches (1.13 auto-disabled
-rendering; 1.17 really renders). Still not running on 1.17: cloth family (known nconmax
-overflow, pre-existing) and primitives (rc=1, needs triage); aloha_pot recovered in later
-sweeps (~400k steps/s, 6.3× behind NVIDIA). Raw data:
-`/matx/u/knatalia/warp-rocm-logs/bench-results-{16809526,16811065,16812544}.log` and the
-nightly JSONL files from google-deepmind.github.io/mujoco_warp/nightly.
+1. **Conditional graph nodes (still AMD-blocked).** The L40S graph has **144 kernel nodes
+   plus a conditional node**; ours has **288 unrolled** kernel nodes. NVIDIA's `capture_while`
+   exits the solver at convergence (~3 iterations on G1); we must replay the full fixed
+   budget (10). This is structural, not tuning, and only AMD can unblock it.
+2. **Collision-dominated scenes.** `aloha_sdf` (12.2x) and `unitree_g1_hfield` (10.4x)
+   barely improved from warm capture -- their cost is collision compute, not allocation.
+   These are the top targets for our own optimization work.
+3. Residual warm-graph allocations: hfield still captures 7 memAlloc + 7 memFree even warm
+   (flat captures none). Worth hoisting those too.
 
-### The benchmark gap is mostly COLD CAPTURE, not compute (2026-08-17)
-
-Comparing our eager per-step timings (job 16811026) against the same scenes in the
-benchmark sweep reveals that `mjwarp-testspeed` captures its graph **cold** — on a fresh
-`Data`, before any step has run — so all 46 per-step scratch arrays are allocated *inside*
-the graph as mempool nodes and **re-allocated on every replay**. At 8192 worlds those
-buffers are hundreds of MB, and ROCm's graph-mode allocation replay is brutally expensive:
-
-| scene (8192 worlds) | our eager | our cold-graph (= benchmark) | NVIDIA (cold-graph) | cold/eager | **eager vs NV** |
-|---|---|---|---|---|---|
-| unitree_g1_flat | 5.51 ms | 11.33 ms | 3.24 ms | 2.06× | **1.70×** |
-| unitree_g1_hfield | 8.05 ms | 63.47 ms | 4.88 ms | 7.88× | **1.65×** |
-
-**Our eager execution is only ~1.7× behind NVIDIA on both scenes** — strikingly consistent,
-and a completely different story from the 3.5×/13.0× the sweep reports. Cold capture is
-*slower than not using graphs at all* (2× on flat, 7.9× on hfield); the same effect was
-already visible at 256 worlds in `g1_warmcap` (cold 8.98 ms vs warm 1.63 ms).
-
-Note NVIDIA's published numbers use the same cold-capturing harness, so the comparison was
-methodologically fair — the finding is that **ROCm punishes cold capture far more than CUDA
-does**, and that our scratch cache only pays off when the capture is warm. Fix (in the
-compat patch): `cli.unroll` now runs 3 warmup steps before capturing, which is also correct
-benchmark practice — it moves one-time allocation out of the measured steady state.
-Caveat: re-running our sweep warm while comparing against NVIDIA's cold numbers is no
-longer strictly apples-to-apples; report both, and treat the ~1.7× eager comparison as the
-honest estimate of the compute gap.
-
-Guidance for users unchanged and now doubly important: **warm up before `wp.ScopedCapture`**
-(see the warm-capture caveat above). Tools: `rocm-tools/cold_vs_warm.py` (node census +
-replay timing for cold vs warm at any scale), `rocm-tools/traj_ab.py` (eager/cold/warm on a
-replay trajectory).
+**Refuted -- do not retry without new evidence:** wave-aware block sizing. mujoco_warp
+derives solver widths as `clamp(round_up_32(nv), 32, 256)` and keeps eight static 32-wide
+defaults, which look wrong on 64-lane wavefronts, and the scenes rounding to 32 (franka
+nv=9, humanoid nv=27, clutter nv=22) were exactly the worst-gap scenes. Measured, it is
+wrong: on franka every wave-aligned override was **slower** (`linesearch_iterative=64` by
+30%, full wave-aware set by 23%); humanoid and g1_flat moved +1-2%, inside noise. Reason:
+`launch_tiled(dim=nworld)` creates one block per world regardless of block size, so raising
+`block_dim` does not fill idle wavefronts -- it assigns more threads to tiles only `nv`
+wide, while reducing blocks resident per CU. Tool: `rocm-tools/blockdim_tune.py`.
 
 ### Optimization round findings (2026-08-15)
 

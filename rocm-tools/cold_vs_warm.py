@@ -16,19 +16,31 @@ mjm = mujoco.MjModel.from_xml_path(xml)
 mjd = mujoco.MjData(mjm)
 mujoco.mj_forward(mjm, mjd)
 
-hip = ctypes.CDLL("libamdhip64.so")
+# Graph node census works on either backend: HIP and CUDA expose the same
+# graph introspection entry points (hip*/cuda* names) with identical semantics.
 NODE_TYPES = {0: "kernel", 1: "memcpy", 2: "memset", 3: "host", 4: "subgraph", 5: "empty", 10: "memAlloc", 11: "memFree"}
+_lib, _pfx = None, None
+for _name, _p in (("libamdhip64.so", "hip"), ("libcudart.so", "cuda")):
+    try:
+        _lib, _pfx = ctypes.CDLL(_name), _p
+        break
+    except OSError:
+        continue
 
 
 def census(graph_handle):
+    if _lib is None:
+        return -1, Counter()
+    get_nodes = getattr(_lib, f"{_pfx}GraphGetNodes")
+    get_type = getattr(_lib, f"{_pfx}GraphNodeGetType")
     n = ctypes.c_size_t(0)
-    hip.hipGraphGetNodes(graph_handle, None, ctypes.byref(n))
+    get_nodes(graph_handle, None, ctypes.byref(n))
     nodes = (ctypes.c_void_p * max(n.value, 1))()
-    hip.hipGraphGetNodes(graph_handle, nodes, ctypes.byref(n))
+    get_nodes(graph_handle, nodes, ctypes.byref(n))
     counts = Counter()
     for i in range(n.value):
         t = ctypes.c_int(-1)
-        hip.hipGraphNodeGetType(ctypes.c_void_p(nodes[i]), ctypes.byref(t))
+        get_type(ctypes.c_void_p(nodes[i]), ctypes.byref(t))
         counts[NODE_TYPES.get(t.value, f"type{t.value}")] += 1
     return n.value, counts
 
