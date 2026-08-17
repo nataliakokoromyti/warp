@@ -159,11 +159,40 @@ Fixing capture warmth (3 warmup steps before capture, now in the compat patch's
 | aloha_sdf | 32,839 | 33,623 | 1.02x | 12.5x -> 12.2x |
 | unitree_g1_hfield_render | 59,910 | 60,850 | 1.02x | 2.9x -> 2.8x |
 
-Geomean **1.43x** throughput from the warmth fix alone; gap vs the published NVIDIA
-dashboard falls 5.89x -> 4.12x geomean. Against our *own* L40S measurement (same scene,
-warm both sides) g1_flat is **1.35-1.44x**, i.e. the same ~1.7x ballpark as the eager
-comparison. NVIDIA's published numbers come from an RTX 6000 Ada -- same Ada generation as
-our L40S -- and their harness is cold too, which costs them almost nothing.
+Geomean **1.43x** throughput from the warmth fix alone.
+
+### The definitive comparison: same source, same harness, both measured by us
+
+L40S (stock warp 1.16 + our compat patch) vs MI350X (rocm-117 + same patch), warm capture
+on both, identical scenes and world counts:
+
+| scene | MI350X | L40S | L40S/AMD |
+|---|---|---|---|
+| unitree_g1_flat | 1,507,513 | 2,119,598 | **1.41x** |
+| three_humanoids | 502,256 | 903,517 | 1.80x |
+| unitree_g1_hfield_render | 60,850 | 161,748 | 2.66x |
+| mug | 155,746 | 440,432 | 2.83x |
+| myoarm | 373,955 | 1,235,704 | 3.30x |
+| aloha_pot | 605,147 | 2,354,840 | 3.89x |
+| humanoid | 1,397,633 | 5,474,229 | 3.92x |
+| franka_emika_panda | 5,077,361 | 22,208,930 | 4.37x |
+| aloha_clutter | 68,987 | 346,813 | 5.03x |
+| unitree_g1_hfield | 161,122 | 1,040,014 | 6.45x |
+| aloha_sdf | 33,623 | 378,106 | **11.25x** |
+| **geomean** | | | **3.65x** |
+
+That is the honest number to quote: **3.65x geomean behind an L40S** (a workstation-class
+Ada card) on identical software. The gap concentrates in two buckets, both explained:
+collision-heavy scenes (sdf, hfield, clutter) and small-`nv` solver scenes (franka nv=9,
+humanoid nv=27, pot) where NVIDIA's conditional-node early exit means it runs ~1-3 solver
+iterations to our fixed 10.
+
+**Corrected long-standing issue**: the cloth family (`cloth`, `cloth_render`,
+`aloha_cloth`) overflows on the **L40S too** (22/31/31 worlds vs our 26/29/29) with the
+same assets and settings. The old handoff item claiming AMD uniquely needs `nconmax~26000`
+was wrong -- this is a mujoco_warp/scene-config issue, not a ROCm accounting difference.
+`primitives` runs on the L40S (1.19M steps/s) but still fails on AMD -- that one *is*
+ours to triage.
 
 Where the remaining gap actually lives, now that allocation noise is gone:
 
@@ -221,8 +250,9 @@ wide, while reducing blocks resident per CU. Tool: `rocm-tools/blockdim_tune.py`
   captured solver loops run fixed iteration counts.
 - **Device-side abort loses printf output**: gfx950 HSA queue aborts (intentional traps,
   OOB asserts) fire before device printf flushes; tests accept the HSA error signature.
-- Cloth benchmarks need `nconmax≈26000` vs the NVIDIA-tuned 2,200 (physics verified
-  correct vs CPU over 1,000-step rollouts — accounting difference unexplained).
+- ~~Cloth benchmarks need `nconmax≈26000` vs the NVIDIA-tuned 2,200~~ — **retired
+  2026-08-17**: the same overflow reproduces on an NVIDIA L40S with identical assets and
+  settings, so it is not an AMD accounting difference. Upstream/scene issue.
 
 ## ROCm bugs worth filing with AMD (minimal repros exist in this history)
 
