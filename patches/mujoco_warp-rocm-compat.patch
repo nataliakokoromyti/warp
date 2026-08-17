@@ -46,10 +46,19 @@ index 735814c..ae1532f 100644
          fn(*(m, d) if rc is None else (m, d, rc))
        jit_end = time.perf_counter()
 diff --git a/mujoco_warp/_src/collision_convex.py b/mujoco_warp/_src/collision_convex.py
-index 9383b51..1760e3f 100644
+index 9383b51..d946412 100644
 --- a/mujoco_warp/_src/collision_convex.py
 +++ b/mujoco_warp/_src/collision_convex.py
-@@ -167,12 +167,16 @@ def ccd_hfield_kernel_builder(
+@@ -50,6 +50,8 @@ from mujoco_warp._src.types import mat63
+ from mujoco_warp._src.types import vec5
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
++from mujoco_warp._src.warp_util import scratch_zeros
+ 
+ # TODO(team): improve compile time to enable backward pass
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+@@ -167,12 +169,16 @@ def ccd_hfield_kernel_builder(
    gjk_iterations: int,
    epa_iterations: int,
    geomgeomid: int,
@@ -68,7 +77,7 @@ index 9383b51..1760e3f 100644
    def ccd_hfield_kernel(
      # Model:
      opt_ccd_tolerance: wp.array[float],
-@@ -250,6 +254,7 @@ def ccd_hfield_kernel_builder(
+@@ -250,6 +256,7 @@ def ccd_hfield_kernel_builder(
      # Data out:
      overflow_out: wp.array[int],
    ):
@@ -76,7 +85,7 @@ index 9383b51..1760e3f 100644
      collisionid = wp.tid()
      if collisionid >= ncollision_in[0]:
        return
-@@ -714,7 +719,14 @@ def ccd_hfield_kernel_builder(
+@@ -714,7 +721,14 @@ def ccd_hfield_kernel_builder(
  
  
  _CCD_OVERSUBSCRIBE_WAVES = 2
@@ -91,7 +100,7 @@ index 9383b51..1760e3f 100644
  
  
  @cache_kernel
-@@ -953,7 +965,7 @@ def ccd_kernel_builder(
+@@ -953,7 +967,7 @@ def ccd_kernel_builder(
  
    # runs convex collision on a set of geom pairs to recover contact info (non-heightfield)
    @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(block_dim, _CCD_MIN_BLOCKS))
@@ -100,7 +109,37 @@ index 9383b51..1760e3f 100644
      # Model:
      opt_ccd_tolerance: wp.array[float],
      geom_type: wp.array[int],
-@@ -1246,8 +1258,11 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
+@@ -1205,20 +1219,22 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
+     nmaxmeshdeg = max(m.nmaxmeshdeg, 3)
+ 
+   # ccd collider count
+-  nccd = wp.zeros(len(GeomType) * (len(GeomType) + 1) // 2, dtype=int)
++  nccd = scratch_zeros(d, "ccd.nccd", len(GeomType) * (len(GeomType) + 1) // 2, int)
+ 
++  # EPA scratch, cached on Data: these are re-allocated on every call otherwise,
++  # which leaves memAlloc/memFree nodes in an otherwise warm-captured graph.
+   # epa_vert: vertices in EPA polytope
+-  epa_vert = wp.empty(shape=(d.naccdmax, 10 + 2 * epa_iterations), dtype=wp.vec3)
++  epa_vert = scratch_empty(d, "ccd.epa_vert", (d.naccdmax, 10 + 2 * epa_iterations), wp.vec3)
+   # epa_vert_index: vertex indices in EPA polytope
+-  epa_vert_index = wp.empty(shape=(d.naccdmax, 10 + 2 * epa_iterations), dtype=int)
++  epa_vert_index = scratch_empty(d, "ccd.epa_vert_index", (d.naccdmax, 10 + 2 * epa_iterations), int)
+   # epa_face: faces of polytope represented by three indices
+-  epa_face = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=int)
++  epa_face = scratch_empty(d, "ccd.epa_face", (d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), int)
+   # epa_pr: projection of origin on polytope faces
+-  epa_pr = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=wp.vec3)
++  epa_pr = scratch_empty(d, "ccd.epa_pr", (d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), wp.vec3)
+   # epa_norm2: epa_pr * epa_pr
+-  epa_norm2 = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=float)
++  epa_norm2 = scratch_empty(d, "ccd.epa_norm2", (d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), float)
+   # epa_horizon: index pair (i j) of edges on horizon
+-  epa_horizon = wp.empty(shape=(d.naccdmax, MJ_MAX_EPAHORIZON), dtype=int)
++  epa_horizon = scratch_empty(d, "ccd.epa_horizon", (d.naccdmax, MJ_MAX_EPAHORIZON), int)
+ 
+   # Contact outputs
+   contact_outputs = [
+@@ -1246,8 +1262,11 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
      count, geomgeomid = _pair_count(g1, g2)
      if (g1 == GeomType.HFIELD or g2 == GeomType.HFIELD) and count:
        wp.launch(
