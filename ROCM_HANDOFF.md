@@ -119,6 +119,29 @@ Node census proves the mechanism: our cold graph = 288 kernel + **34 memAlloc** 
 warm graph = 288 kernel, **zero** alloc nodes. So **graph-captured allocation nodes cost
 CUDA ~6% and ROCm ~120%** -- the single most quotable number for AMD (see bug list below).
 
+Re-running the L40S side with **our compat patch applied** (it is HIP-conditional, so on
+CUDA only the vendor-neutral parts activate) gives a clean same-source hardware comparison:
+
+| @8192, same source | MI350X | L40S | ratio |
+|---|---|---|---|
+| g1_flat eager | 5.56 ms | 5.45 ms | 1.02x (parity) |
+| g1_flat warm-graph | 5.09 ms | 3.79 ms | **1.34x** |
+| hfield eager | 9.60 ms | 53.27 ms | 0.18x (**AMD 5.6x faster**) |
+| hfield warm-graph | 7.08 ms | 6.72 ms | 1.05x |
+
+Two things this run also proves: the **scratch cache is vendor-neutral** (the L40S warm
+graph drops from 34 memAlloc nodes to zero with our patch -- a real upstream contribution,
+CUDA just suffers less without it), and the **7 residual warm-capture allocations on hfield
+appear on BOTH vendors**, so that is a mujoco_warp bug rather than a ROCm one.
+
+> **Caveat on the two-scene table above**: `cold_vs_warm.py` steps without a control
+> trajectory, so the robot settles. The benchmark suite replays `shuffle_dance.npz` with
+> ctrl noise. For g1_flat the workloads agree (5.09 vs 5.43 ms, 1.07x) so its numbers are
+> representative; for **hfield the replay workload is 7.2x more expensive** (50.8 vs
+> 7.1 ms) because the robot walks over terrain generating far more contacts. Treat the
+> hfield "parity" as valid for the settled workload only -- the sweep table below is the
+> representative comparison.
+
 Fixing capture warmth (3 warmup steps before capture, now in the compat patch's
 `cli.unroll`) moves the whole suite:
 
