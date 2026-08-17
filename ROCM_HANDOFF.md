@@ -141,6 +141,38 @@ sweeps (~400k steps/s, 6.3× behind NVIDIA). Raw data:
 `/matx/u/knatalia/warp-rocm-logs/bench-results-{16809526,16811065,16812544}.log` and the
 nightly JSONL files from google-deepmind.github.io/mujoco_warp/nightly.
 
+### The benchmark gap is mostly COLD CAPTURE, not compute (2026-08-17)
+
+Comparing our eager per-step timings (job 16811026) against the same scenes in the
+benchmark sweep reveals that `mjwarp-testspeed` captures its graph **cold** — on a fresh
+`Data`, before any step has run — so all 46 per-step scratch arrays are allocated *inside*
+the graph as mempool nodes and **re-allocated on every replay**. At 8192 worlds those
+buffers are hundreds of MB, and ROCm's graph-mode allocation replay is brutally expensive:
+
+| scene (8192 worlds) | our eager | our cold-graph (= benchmark) | NVIDIA (cold-graph) | cold/eager | **eager vs NV** |
+|---|---|---|---|---|---|
+| unitree_g1_flat | 5.51 ms | 11.33 ms | 3.24 ms | 2.06× | **1.70×** |
+| unitree_g1_hfield | 8.05 ms | 63.47 ms | 4.88 ms | 7.88× | **1.65×** |
+
+**Our eager execution is only ~1.7× behind NVIDIA on both scenes** — strikingly consistent,
+and a completely different story from the 3.5×/13.0× the sweep reports. Cold capture is
+*slower than not using graphs at all* (2× on flat, 7.9× on hfield); the same effect was
+already visible at 256 worlds in `g1_warmcap` (cold 8.98 ms vs warm 1.63 ms).
+
+Note NVIDIA's published numbers use the same cold-capturing harness, so the comparison was
+methodologically fair — the finding is that **ROCm punishes cold capture far more than CUDA
+does**, and that our scratch cache only pays off when the capture is warm. Fix (in the
+compat patch): `cli.unroll` now runs 3 warmup steps before capturing, which is also correct
+benchmark practice — it moves one-time allocation out of the measured steady state.
+Caveat: re-running our sweep warm while comparing against NVIDIA's cold numbers is no
+longer strictly apples-to-apples; report both, and treat the ~1.7× eager comparison as the
+honest estimate of the compute gap.
+
+Guidance for users unchanged and now doubly important: **warm up before `wp.ScopedCapture`**
+(see the warm-capture caveat above). Tools: `rocm-tools/cold_vs_warm.py` (node census +
+replay timing for cold vs warm at any scale), `rocm-tools/traj_ab.py` (eager/cold/warm on a
+replay trajectory).
+
 ### Optimization round findings (2026-08-15)
 
 - **MFMA (rocWMMA) tile matmul restored but restricted to single-wave blocks**

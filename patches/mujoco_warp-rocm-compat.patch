@@ -1,3 +1,50 @@
+diff --git a/benchmarks/run.py b/benchmarks/run.py
+index 2e6699b..4f343fd 100644
+--- a/benchmarks/run.py
++++ b/benchmarks/run.py
+@@ -65,7 +65,13 @@ def _git(*args, cwd: Path | None = None, check: bool = True):
+ def _uv_run(*args, cwd: Path | None = None):
+   """Run a uv command, returning CompletedProcess."""
+   log.info("Command: uv run %s", " ".join(args))
+-  return subprocess.run(("uv", "run") + args, cwd=cwd, check=True, capture_output=True, text=True)
++  try:
++    return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True)
++  except subprocess.CalledProcessError as e:
++    print(f"BENCHMARK_FAILED rc={e.returncode}: {args[1] if len(args) > 1 else args}")
++    print((e.stderr or "")[-3000:])
++    return e
++
+ 
+ 
+ # benchmark discovery, assembly, and execution
+@@ -133,7 +139,7 @@ def _run_benchmark(bm: dict, input_dir: Path) -> dict:
+     (benchmark_root / bm["mjcf"]).as_posix(),
+     f"--clear_warp_cache={_ARGS.clear_warp_cache}",
+     "--format=short",
+-    "--event_trace=true",
++    "--event_trace=false",
+     "--memory=true",
+     "--measure_solver=true",
+     "--measure_alloc=true",
+diff --git a/mujoco_warp/_src/cli.py b/mujoco_warp/_src/cli.py
+index 735814c..ae1532f 100644
+--- a/mujoco_warp/_src/cli.py
++++ b/mujoco_warp/_src/cli.py
+@@ -211,6 +211,14 @@ def unroll(
+   with wp.ScopedDevice(wp.get_device(DEVICE.value)):
+     with warp_util.EventTracer(enabled=EVENT_TRACE.value) as tracer:
+       jit_beg = time.perf_counter()
++      # Warm up before capturing: the first calls trigger lazy allocations
++      # (solver/collision contexts, sensor and tendon scratch). Capturing cold
++      # records those as mempool alloc/free nodes, which replay slowly on ROCm
++      # (and add avoidable nodes on CUDA); after warmup the capture is
++      # kernel-only.
++      for _ in range(3):
++        fn(*(m, d) if rc is None else (m, d, rc))
++      wp.synchronize_device()
+       with wp.ScopedCapture() as capture:
+         fn(*(m, d) if rc is None else (m, d, rc))
+       jit_end = time.perf_counter()
 diff --git a/mujoco_warp/_src/collision_convex.py b/mujoco_warp/_src/collision_convex.py
 index 9383b51..1760e3f 100644
 --- a/mujoco_warp/_src/collision_convex.py
