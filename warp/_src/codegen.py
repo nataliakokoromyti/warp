@@ -6397,6 +6397,18 @@ cuda_module_header = """
 #if !defined(__HIPCC__)
 #define WP_NO_CRT
 #endif
+
+// Default launch bounds for kernels that do not declare their own. HIP needs
+// them: an undeclared kernel is compiled for the maximum flat workgroup size
+// (1024 threads, 16 waves on one CU), which caps it at 128 VGPRs and spills
+// large kernels to scratch. A module is compiled once per block_dim, so
+// WP_TILE_BLOCK_DIM is the width these kernels are launched with. Expands to
+// nothing on NVIDIA so generated CUDA source is unchanged.
+#if defined(__HIPCC__)
+#define WP_DEFAULT_LAUNCH_BOUNDS __launch_bounds__(WP_TILE_BLOCK_DIM)
+#else
+#define WP_DEFAULT_LAUNCH_BOUNDS
+#endif
 #include "builtin.h"
 #include "deterministic.h"
 
@@ -7446,6 +7458,15 @@ def codegen_kernel(kernel, device, options):
                 raise ValueError(f"launch_bounds must be an int or a tuple/list of 1-2 ints, got {launch_bounds}")
         else:
             raise ValueError(f"launch_bounds must be an int or a tuple/list of 1-2 ints, got {type(launch_bounds)}")
+    elif device == "cuda":
+        # No explicit launch_bounds. On HIP this is not free: without
+        # __launch_bounds__ the compiler must assume the maximum flat workgroup
+        # size (1024 threads = 16 waves on one CU), which caps the kernel at 128
+        # VGPRs and makes large kernels spill to scratch. Warp compiles a module
+        # once per block_dim, so the launch width is known here; declare it.
+        # WP_DEFAULT_LAUNCH_BOUNDS expands to nothing on NVIDIA, keeping the
+        # generated CUDA source byte-identical.
+        launch_bounds_str = "WP_DEFAULT_LAUNCH_BOUNDS "
 
     # Generate cluster_dims string for CUDA kernels.
     # 1 is the implicit default and is treated as a no-op so that

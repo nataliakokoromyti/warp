@@ -1,0 +1,1 @@
+Declare `__launch_bounds__` on HIP for kernels that do not set the `launch_bounds` option. Without it the compiler assumes a 1024-thread workgroup and caps the kernel at 128 VGPRs, so register-hungry kernels spill to scratch; mujoco_warp's SDF narrowphase spilled 465 VGPRs and ran 1.4x slower on an MI350X. CUDA code generation is unaffected.
