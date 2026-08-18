@@ -51,13 +51,41 @@ initialization first (0 in 37,000). So it is neither a workgroup-scheduling prob
 H2D ordering problem, and the 8-XCD workgroup distribution (this machine runs SPX / NPS1)
 is not the explanation either -- **it only happens to memory that came from `hipMalloc`.**
 
-**Our read**: freshly-`hipMalloc`ed VRAM is zeroed by the driver's scrubber before being
-handed to the application. If that scrub is still in flight when the new owner's kernel
-writes -- chunked across engines, which would explain the 1 KB / 8 KB lattice -- the
-scrubber's zeros land *after* the kernel's data. Every observation fits: the surviving
-values are always exactly `0.0`; they are in device memory after a full synchronize; pool
-allocations, which reuse memory without a fresh scrub, are immune; and a busy device, which
-delays the scrub, is what makes it appear.
+**Minimal reproduction** -- no copies, no graphs, no streams, no host transfers:
+
+```python
+a = hipMalloc(4 MB)                # memory pool disabled
+kernel<<<3907, 256>>>(a)           # a[tid] = 1.0
+hipDeviceSynchronize()
+read a back                        # some blocks are still 0.0
+```
+
+Eight concurrent processes doing this hit it in **3 of 8**, roughly once per 4,000
+iterations each. A representative occurrence:
+
+```
+bad_elems 124992   bad_blocks 489 of 3907   whole_blocks_missing True
+block_residues_mod8 [2]   first_blocks [2, 10, 18, 26, 34, 42]
+all_zero True   repaired_by_reread False
+```
+
+**Every missing block shares one residue mod 8** (2 here; 1 and 4 in other occurrences).
+In SPX mode workgroups are distributed round-robin across the 8 XCDs, so this is exactly
+one XCD's share of the launch producing nothing.
+
+**Two readings, and we would like your help choosing.** At `block_dim = 256` floats, one
+block is exactly 1 KB, which is also the damage granularity -- so these fit equally well:
+
+1. **Workgroup loss**: one XCD's workgroups do not run (or their writes are dropped), and
+   the surviving zeros are the untouched scrub values.
+2. **Scrub ordering**: freshly-`hipMalloc`ed VRAM is zeroed by the driver's scrubber, that
+   scrub is still in flight when the kernel writes, and the scrubber's zeros land last,
+   chunked across engines at 1 KB / 8 KB.
+
+We are running `block_dim = 64 / 256 / 1024` to separate them (damage scaling with
+`block_dim` implies reading 1; a fixed 1 KB / 8 KB lattice implies reading 2) and will
+share the result. Either way the allocator dependence is solid: `hipMallocAsync` is immune
+across 29,000+ launches under the same load.
 
 **Trigger**: process-level concurrency on a single device. One process is clean over 6,000
 iterations; **eight concurrent processes doing the same work hit it in 2-7 of 8**, at
