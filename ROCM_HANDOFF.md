@@ -539,15 +539,33 @@ DROPPED iter 474: {'bad_elems': 124992, 'bad_blocks': 489, 'total_blocks': 3907,
                    'all_zero': True, 'repaired_by_reread': False}
 ```
 
-**Every missing block shares one residue mod 8** (2 here; 4 and 1 in other occurrences) --
-blocks 2, 10, 18, 26, ... In SPX mode workgroups round-robin across the 8 XCDs, so this is
-exactly "one XCD's entire share of the launch". *But* 256 floats per block is exactly 1 KB,
-which is also the damage granularity, so "one thread block in eight" and "a fixed 1 KB per
-8 KB byte lattice" are still indistinguishable at this block size. `block_dropout.py
---block-dim {64,256,1024}` separates them: if the damage scales with `block_dim` it tracks
-thread blocks (a workgroup-scheduling bug); if it stays 1 KB per 8 KB it tracks a byte
-lattice (a DMA or scrub chunking bug). That is the last open question, and it decides
-whether this is a compute-scheduling defect or an allocator one.
+**Every missing block shares one residue mod 8** (2 here; 1, 4, 5 and 7 in other
+occurrences) -- blocks 2, 10, 18, 26, ... In SPX mode workgroups round-robin across the 8
+XCDs, so this is exactly "one XCD's entire share of the launch".
+
+### Confirmed: the damage tracks thread blocks, not bytes
+
+At 256 floats per block, one block is exactly 1 KB, which is also the damage granularity --
+so "one thread block in eight" and "a fixed 1 KB / 8 KB byte lattice" were indistinguishable.
+Varying `block_dim` separates them, and the answer is unambiguous:
+
+| `block_dim` | run length | run stride | elements lost (of 1,000,000) | residues mod 8 |
+|---|---|---|---|---|
+| 64 | **256 B** | **2 KB** | 124,992 | single value |
+| 256 | **1 KB** | **8 KB** | 124,928 / 125,184 | single value |
+| 1024 | **4 KB** | **32 KB** | 124,928 | single value |
+
+Run length is exactly `block_dim x 4` bytes and the stride is exactly `8 x block_dim x 4`,
+at every block size, while the *fraction* lost stays 1/8. **The unit of loss is the thread
+block, and exactly one of the eight round-robin XCD classes is lost.** A DMA or scrub
+chunking bug would have kept a fixed byte lattice; it does not.
+
+**Most likely mechanism** (a reading, not a measurement): a fresh `hipMalloc` establishes a
+new virtual-to-physical mapping, and under multi-process contention one XCD's TLB/L2 is not
+updated for it, so that XCD's workgroups write somewhere stale while the readback sees the
+correct pages holding their scrubbed zeros. That would explain why pool allocations, which
+reuse existing mappings, are immune; why the values are always exactly `0.0`; and why a full
+device synchronize does not repair it.
 
 **What to hand AMD**: written up as issue 0 in `AMD_ROCM_ISSUES.md`, with the minimal
 repro above.
