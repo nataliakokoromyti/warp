@@ -11,12 +11,18 @@ CDNA4) is an 8-XCD part and distributes workgroups round-robin across XCDs, so
 "every 8th block" is "one XCD's share". A full device synchronize and re-read
 does not repair it, so the writes never landed.
 
-This script tests whether the effect is specific to Warp's copy kernels or hits
-*any* kernel: it launches a trivial write kernel, reads it back, and reports the
-missing block indices and their residue modulo 8. It only reproduces under
-multi-process contention -- run several copies concurrently against one GPU::
+A trivial kernel writing into a device-allocated (``wp.zeros``) buffer does
+**not** reproduce it: 0 in 29,000 launches across 8 concurrent processes. What
+every failing case does instead is initialize the buffer with a **host-to-device
+copy of a multi-MB numpy array** and then run the kernel over it. ``--h2d-init``
+switches to that, which is the discriminating experiment: if the leftover 1 KB
+blocks hold the *h2d* values rather than the kernel's, then part of a chunked
+H2D transfer is landing after the kernel that was supposed to follow it.
 
-    for i in $(seq 8); do python block_dropout.py --iters 3000 & done; wait
+Only reproduces under multi-process contention -- run several copies
+concurrently against one GPU::
+
+    for i in $(seq 8); do python block_dropout.py --iters 3000 --h2d-init & done; wait
 """
 
 import argparse
@@ -41,7 +47,9 @@ def analyze(got, n):
         return None
     blocks = sorted(set((bad // BLOCK).tolist()))
     residues = sorted({b % 8 for b in blocks})
-    whole = all(int(np.count_nonzero(got[b * BLOCK : (b + 1) * BLOCK] != 1.0)) in (BLOCK, n - b * BLOCK) for b in blocks)
+    whole = all(
+        int(np.count_nonzero(got[b * BLOCK : (b + 1) * BLOCK] != 1.0)) in (BLOCK, n - b * BLOCK) for b in blocks
+    )
     return {
         "bad_elems": int(bad.size),
         "bad_blocks": len(blocks),
@@ -58,17 +66,33 @@ def main():
     parser.add_argument("--iters", type=int, default=3000)
     parser.add_argument("--n", type=int, default=1000000)
     parser.add_argument("--max-reports", type=int, default=5)
+    parser.add_argument(
+        "--h2d-init",
+        action="store_true",
+        help="initialize the buffer with a host-to-device copy of a numpy array instead of a "
+        "device-side zero fill (this is what wp.array(data=...) does, and what every failing "
+        "test does before the kernel that gets clobbered)",
+    )
     args = parser.parse_args()
 
     wp.init()
     device = wp.get_device("cuda:0")
-    print(f"device: {device} n={args.n} blocks={(args.n + BLOCK - 1) // BLOCK} iters={args.iters}", flush=True)
+    print(
+        f"device: {device} n={args.n} blocks={(args.n + BLOCK - 1) // BLOCK} "
+        f"iters={args.iters} h2d_init={args.h2d_init}",
+        flush=True,
+    )
+
+    host_init = np.zeros(args.n, dtype=np.float32) if args.h2d_init else None
 
     bad_count = 0
     reports = 0
     t0 = time.perf_counter()
     for i in range(args.iters):
-        a = wp.zeros(args.n, dtype=wp.float32, device=device)
+        if args.h2d_init:
+            a = wp.array(data=host_init, device=device, copy=True)
+        else:
+            a = wp.zeros(args.n, dtype=wp.float32, device=device)
         wp.launch(write_ones, dim=args.n, inputs=[a], device=device, block_dim=BLOCK)
         wp.synchronize_device(device)
         got = a.numpy()

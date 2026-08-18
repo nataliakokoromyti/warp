@@ -12,12 +12,13 @@ Everything below is reproducible with scripts in `rocm-tools/` of the branch abo
 
 ---
 
-## 0. Correctness bug (highest severity): a kernel launch silently loses 1 workgroup in 8
+## 0. Correctness bug (highest severity): silent 1-KB-in-8-KB data loss under multi-process load
 
-**Under multi-process contention on one MI350X, a kernel launch can complete "successfully"
-while one thread block in every eight has written nothing.** No error is reported anywhere:
-no launch error, no sticky error, no HSA exception. The missing output is simply absent, and
-a full `hipDeviceSynchronize` plus re-read does not repair it -- the writes never landed.
+**Under multi-process contention on one MI350X, a buffer that was initialized by a
+host-to-device copy and then overwritten by a kernel comes back with a regular lattice of
+1 KB blocks still holding the *pre-kernel* values.** No error is reported anywhere: no
+launch error, no sticky error, no HSA exception. A full `hipDeviceSynchronize` plus re-read
+does not repair it -- the wrong bytes are genuinely in device memory.
 
 This was found chasing an intermittent Warp test failure and only resolved once the damage
 was described structurally rather than counted. On a 1,000,000-element float32 array written
@@ -33,9 +34,20 @@ repaired by sync     : no
 
 Every corrupted-element count we have ever seen falls out of that: 489x256 = 125,184;
 488x256 = 124,928; 488x256+64 = 124,992 (partial final block). Only the phase varies
-between occurrences (first bad block at 0, 256, 512, 1792, 12288, ...). MI350X is an
-8-XCD part and distributes workgroups round-robin across XCDs in SPX mode, so "every 8th
-workgroup" is "one XCD's share of the launch".
+between occurrences (first bad block at 0, 256, 512, 1792, 12288, ...). In bytes the
+pattern is **1 KB lost out of every 8 KB**.
+
+**What it is not**: a trivial `a[tid] = 1.0` kernel writing into a device-allocated
+(`hipMallocAsync` + device fill) buffer does **not** reproduce it -- 0 in 29,000 launches
+across 8 concurrent processes -- so this is not simply "a launch loses workgroups", and the
+8-XCD workgroup distribution (the machine runs in SPX / NPS1) is not on its own the
+explanation.
+
+**What every failing case does have** is a **multi-megabyte host-to-device copy of pageable
+memory immediately before the kernel** whose output goes missing (`wp.array(data=numpy_array)`
+in our case), and the leftover bytes are exactly the H2D source values. That points at a
+chunked H2D transfer completing *after* the kernel that the stream ordered behind it, with
+the interleave granularity of the split showing up as the 1 KB / 8 KB lattice.
 
 **Trigger**: process-level concurrency on a single device. One process is clean over 6,000
 iterations; **eight concurrent processes doing the same work hit it in 5-7 of 8**, at
@@ -47,11 +59,11 @@ on whichever buffer a kernel most recently wrote.
 wrong-answer bug, not a crash. Any multi-tenant MI350X workload -- which is the normal way
 these machines are used -- is exposed.
 
-**Repro**: `rocm-tools/block_dropout.py` (a trivial `a[tid] = 1.0` kernel, reporting missing
-block indices and their residue mod 8) and `rocm-tools/copy_repro.py`; run eight copies
-concurrently against one GPU. Please tell us what to capture on our side --
-`rocm-smi --showcomputepartition`, queue counts, `GPU_MAX_HW_QUEUES` -- and whether a
-compute-partition mode or a known scheduler fix changes it.
+**Repro**: `rocm-tools/copy_repro.py` and `rocm-tools/block_dropout.py --h2d-init`; run
+eight copies concurrently against one GPU. Machine state when reproducing: Compute
+Partition **SPX**, Memory Partition **NPS1**, `HSA_XNACK` and `GPU_MAX_HW_QUEUES` unset.
+Please tell us what else to capture, and whether a chunked pageable H2D is expected to be
+fully ordered against subsequent work on the same stream.
 
 ---
 
