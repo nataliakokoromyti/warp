@@ -524,9 +524,33 @@ failing tests are the ones that deliberately turn pools off to exercise the defa
 allocator. Do not disable memory pools on MI350X (`wp.ScopedMempool(device, False)`,
 `WARP_MEMPOOL`-style overrides) on a shared device.
 
-**What to hand AMD**: `hipMalloc` returning memory whose asynchronous zero-scrub is not
-ordered against the new owner's kernel writes, reproducible with 8 concurrent processes.
-Written up as issue 0 in `AMD_ROCM_ISSUES.md`.
+### Minimal reproduction
+
+`rocm-tools/block_dropout.py --no-mempool`, eight concurrent processes: allocate ~4 MB with
+`hipMalloc`, launch a kernel writing `1.0` to every element, `hipDeviceSynchronize`, read
+back, look for zeros. **3 of 8 processes hit it** (once each in 4,000 iterations); the same
+run with pools enabled is 0 of 8. No copies, no graphs, no streams, no host-to-device
+transfer -- just allocate, write, read.
+
+```
+DROPPED iter 474: {'bad_elems': 124992, 'bad_blocks': 489, 'total_blocks': 3907,
+                   'whole_blocks_missing': True, 'block_residues_mod8': [2],
+                   'first_blocks': [2, 10, 18, 26, 34, 42],
+                   'all_zero': True, 'repaired_by_reread': False}
+```
+
+**Every missing block shares one residue mod 8** (2 here; 4 and 1 in other occurrences) --
+blocks 2, 10, 18, 26, ... In SPX mode workgroups round-robin across the 8 XCDs, so this is
+exactly "one XCD's entire share of the launch". *But* 256 floats per block is exactly 1 KB,
+which is also the damage granularity, so "one thread block in eight" and "a fixed 1 KB per
+8 KB byte lattice" are still indistinguishable at this block size. `block_dropout.py
+--block-dim {64,256,1024}` separates them: if the damage scales with `block_dim` it tracks
+thread blocks (a workgroup-scheduling bug); if it stays 1 KB per 8 KB it tracks a byte
+lattice (a DMA or scrub chunking bug). That is the last open question, and it decides
+whether this is a compute-scheduling defect or an allocator one.
+
+**What to hand AMD**: written up as issue 0 in `AMD_ROCM_ISSUES.md`, with the minimal
+repro above.
 
 Whatever the final mechanism, the user-visible statement is already solid and serious:
 **on MI350X under multi-process load, Warp can silently return partly stale data.**
