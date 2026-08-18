@@ -7464,8 +7464,9 @@ def codegen_kernel(kernel, device, options):
         # size (1024 threads = 16 waves on one CU), which caps the kernel at 128
         # VGPRs and makes large kernels spill to scratch. Warp compiles a module
         # once per block_dim, so the launch width is known here; declare it.
-        # WP_DEFAULT_LAUNCH_BOUNDS expands to nothing on NVIDIA, keeping the
-        # generated CUDA source byte-identical.
+        # WP_DEFAULT_LAUNCH_BOUNDS preprocesses away outside hipcc, so NVIDIA
+        # keeps the same generated code (the module hash does change once,
+        # since the emitted source text carries the extra macro).
         launch_bounds_str = "WP_DEFAULT_LAUNCH_BOUNDS "
 
     # Generate cluster_dims string for CUDA kernels.
