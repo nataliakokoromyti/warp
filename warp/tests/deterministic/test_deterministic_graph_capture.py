@@ -440,6 +440,26 @@ def _add(name, devices=cuda_devices):
 
 for _name in (
     "test_record_cmd_deterministic_launch",
+    "test_counter_large_launch_rejected",
+    "test_apic_capture_rejects_deterministic_cuda_kernel",
+    "test_capture_while_deterministic_scatter",
+    "test_capture_while_deterministic_counter",
+):
+    _add(_name)
+
+
+# HIP known issue: a deterministic launch allocates its temporary key, value and
+# prefix buffers on every launch, and ROCm 7.2 permits no device allocation at
+# all while a capture is active. hipMallocAsync on the dedicated non-capturing
+# allocation stream fails with "operation not permitted when stream is
+# capturing" even under the relaxed thread capture mode, and non-pooled
+# hipMalloc invalidates the capture outright (Warp refuses it up front, see
+# hip_alloc_forbidden_during_capture() in warp.cu). Capturing a deterministic
+# launch on ROCm needs the temporary buffers cached across launches so that a
+# warm capture allocates nothing; until then these run on real CUDA devices only.
+_capture_alloc_devices = [d for d in cuda_devices if not d.is_hip]
+
+for _name in (
     "test_graph_capture_deterministic_launch",
     "test_graph_capture_sliced_array",
     "test_graph_capture_deterministic_closure_kernel",
@@ -447,12 +467,8 @@ for _name in (
     "test_graph_capture_vec3_atomic_minmax",
     "test_graph_capture_consumed_return_counter",
     "test_graph_capture_indexed_counter",
-    "test_counter_large_launch_rejected",
-    "test_apic_capture_rejects_deterministic_cuda_kernel",
-    "test_capture_while_deterministic_scatter",
-    "test_capture_while_deterministic_counter",
 ):
-    _add(_name)
+    _add(_name, devices=_capture_alloc_devices)
 
 
 if __name__ == "__main__":
