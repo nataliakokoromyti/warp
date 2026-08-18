@@ -422,9 +422,28 @@ background-load variants to localize it.
 
 Every one of those probes was ordering-shaped, and the reproduction says the bug is not
 about ordering -- which is why they were all clean. They also ran far too few copies: at
-roughly one corrupt readback per several thousand, a few hundred iterations was never going
-to see one. `rocm-tools/d2h_integrity.py` fixes both problems: it hammers the readback
-directly, tens of thousands of times, and prints the run/stride structure of any corruption.
+roughly one corrupt readback per couple of thousand, a few hundred iterations was never
+going to see one. `rocm-tools/d2h_integrity.py` fixes both problems -- it hammers the
+readback tens of thousands of times and prints the run/stride structure of any corruption.
+
+It also narrows the trigger, by *not* reproducing:
+
+| d2h_integrity variant | result |
+|---|---|
+| write with a kernel then `.numpy()`, same buffer, 20,000x | **0 corrupt** |
+| same, without rewriting between reads (control) | **0 corrupt** |
+| same, into a **pinned** destination | **0 corrupt** |
+| same, with 2 background GPU-load processes | **0 corrupt** |
+
+80,000 readbacks of a **long-lived** buffer are clean. So it is not simply "a 4 MB D2H
+sometimes drops chunks". What the failing tests do that this does not is **churn the memory
+pool**: every async-copy test allocates fresh multi-MB buffers (`wp.zeros`, which is an
+allocation plus a zero-fill), copies into them, reads them back once, and frees them --
+thousands of times per run. That makes a stream-ordered-allocator hazard the live
+hypothesis: a block handed to a new owner while a previous owner's zero-fill is still in
+flight would land exactly this damage -- whole aligned blocks of zeros, in a buffer the new
+owner has already written. The `--churn` mode probes that, and it is the same class of bug
+as the in-capture-free GPU fault documented below.
 
 **Assessment**: real, reproduces at roughly **50% per full-suite run**, and it **silently
 corrupts data Warp hands back to the user**. This is now the most serious open item in the

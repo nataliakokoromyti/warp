@@ -77,6 +77,16 @@ def describe(bad_idx, n):
     }
 
 
+def _finish(stop_flag, workers):
+    if stop_flag is None:
+        return
+    stop_flag.value = 1
+    for p in workers:
+        p.join(timeout=30)
+        if p.is_alive():
+            p.terminate()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=20000)
@@ -89,6 +99,14 @@ def main():
         action="store_true",
         help="do not re-run the producing kernel before each readback (A/B control: if the "
         "corruption is chunks of the transfer racing the producing kernel, this should be clean)",
+    )
+    parser.add_argument(
+        "--churn",
+        type=int,
+        default=0,
+        help="allocate and free N fresh pool buffers per iteration instead of reusing one, "
+        "so every readback targets recently recycled memory (this is what the async-copy "
+        "tests do: thousands of multi-MB zeros() allocations, each read back once)",
     )
     args = parser.parse_args()
 
@@ -122,6 +140,40 @@ def main():
     bad_count = 0
     reports = 0
     t0 = time.perf_counter()
+
+    if args.churn:
+        # Fresh pool allocations every iteration: zeros() (allocate + zero-fill), then the
+        # producing kernel, then read back. If a previous owner's zero-fill can land after
+        # the pool hands the block to a new owner, this is where it shows up.
+        for i in range(args.iters):
+            buffers = []
+            for _ in range(args.churn):
+                a = wp.zeros(args.n, dtype=wp.float32, device=device)
+                wp.launch(fill_ramp, dim=args.n, inputs=[a, base], device=device)
+                buffers.append(a)
+            for a in buffers:
+                got = a.numpy()
+                if not np.array_equal(got, want):
+                    bad_count += 1
+                    bad_idx = np.flatnonzero(got != want)
+                    if reports < args.max_reports:
+                        reports += 1
+                        zeros = int(np.count_nonzero(got[bad_idx] == 0.0))
+                        wp.synchronize_device(device)
+                        again = a.numpy()
+                        print(
+                            f"CORRUPT iter {i}: all_bad_are_zero={zeros == bad_idx.size} "
+                            f"device_intact_on_reread={np.array_equal(again, want)} "
+                            f"{describe(bad_idx, args.n)}",
+                            flush=True,
+                        )
+            del buffers
+        dt = time.perf_counter() - t0
+        _finish(stop_flag, workers)
+        n_reads = args.iters * args.churn
+        print(f"\n{bad_count}/{n_reads} corrupt readbacks in {dt:.1f}s", flush=True)
+        return 1 if bad_count else 0
+
     for i in range(args.iters):
         # Re-run the producing kernel each iteration, with no explicit sync, so the
         # readback is issued while a write to the same buffer is still in flight. That
@@ -154,12 +206,7 @@ def main():
                 print(f"        re-read after sync matches: {np.array_equal(again, want)}", flush=True)
     dt = time.perf_counter() - t0
 
-    if stop_flag is not None:
-        stop_flag.value = 1
-        for p in workers:
-            p.join(timeout=30)
-            if p.is_alive():
-                p.terminate()
+    _finish(stop_flag, workers)
 
     rate = bad_count / args.iters if args.iters else 0.0
     print(f"\n{bad_count}/{args.iters} corrupt readbacks (rate {rate:.2e}) in {dt:.1f}s", flush=True)
