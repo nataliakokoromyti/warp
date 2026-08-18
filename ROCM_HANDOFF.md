@@ -208,6 +208,46 @@ node support with AMD**, and it also bounds any home-grown workaround (a host-si
 chunked-solver stepper: launch K iterations, read `nsolving`, repeat — costs 1-2 syncs per
 step, which is <1% of a 6.5 ms step).
 
+### Prototype: recovering the conditional-node win without AMD (2026-08-17)
+
+`rocm-tools/chunked_stepper.py` emulates conditional-graph early exit with host-side
+control. It splits the step into three captured graphs -- **pre** (forward dynamics +
+solver init), **chunk** (K solver iterations), **post** (solver tail + sensor_acc +
+integrator) -- and loops on the chunk graph from the host, reading the 1-int `nsolving`
+counter between chunks to stop at convergence. The seam is clean because `_solve`
+decomposes into init / loop / one conditional tail launch, and `m.opt.iterations = 0`
+makes it skip exactly the loop; the solver context it needs already persists on `Data`
+thanks to the scratch cache.
+
+| | MI350X | L40S |
+|---|---|---|
+| franka, monolithic warm graph | 6.525 ms | 2.480 ms |
+| franka, chunked stepper (chunk=1) | **1.693 ms** | 2.488 ms |
+| **speedup** | **3.85x** | 1.00x |
+
+3.85x on HIP against the 4.24x theoretical ceiling (the shortfall is the per-chunk sync),
+and **1.00x on CUDA** -- it costs nothing where conditional nodes already exist, which
+makes it viable as an upstream contribution rather than an AMD-only fork.
+
+Faithfulness is established, not assumed. Comparing 10 steps from an aligned start against
+unmodified `mjw.step`, with a control of a second independent `mjw.step` run:
+
+| scene | chunked vs ref | ref vs ref (control) |
+|---|---|---|
+| franka | 4.547e-13 | 4.547e-13 |
+| humanoid | 5.132e-07 | 5.532e-07 |
+| unitree_g1_flat | 2.362e-06 | 2.667e-06 |
+
+The chunked deviation is at or below mujoco_warp's own run-to-run nondeterminism (atomic
+accumulation order) -- in two scenes it is *closer* to the reference than a repeat run is.
+
+**Status**: prototype, not landed in the library. Productionizing means deciding how users
+opt in (mujoco_warp's `step()` is monolithic by design), and the AMD-side timing rerun with
+the control is still queued. Known constraint, enforced by an assert: the stepper requires a
+warmed `Data` -- built on a cold one, the `nsolving` counter is allocated *inside* the
+capture as a graph allocation and cannot be read from the host (the failed read also
+poisons the HIP context and aborts the process).
+
 **Corrected long-standing issue**: the cloth family (`cloth`, `cloth_render`,
 `aloha_cloth`) overflows on the **L40S too** (22/31/31 worlds vs our 26/29/29) with the
 same assets and settings. The old handoff item claiming AMD uniquely needs `nconmax~26000`
