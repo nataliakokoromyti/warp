@@ -28,6 +28,12 @@ for i in 0 1 2 3 4 5 6; do
   python $AS/stepper_validate.py $SCRATCH/.bench_assets $i auto 2>&1 | grep -E "^STEP|^===|Error|Traceback" || true
 done
 
+echo "=== scene validation, unrolled solver loop, auto policy (HIP's situation on CUDA) ==="
+export STEPPER_UNROLL=1
+for i in 0 1 2 3 4 5 6; do
+  python $AS/stepper_validate.py $SCRATCH/.bench_assets $i auto 2>&1 | grep -E "^STEP|^===|Error|Traceback" || true
+done
+
 echo "=== scene validation, split forced (validates the decomposition itself) ==="
 export STEPPER_FORCE=1
 for i in 0 1 2 3 4 5 6; do

@@ -263,10 +263,13 @@ itself is untouched.
 captures one monolithic graph -- exactly what a caller writes by hand today -- when
 conditional graph nodes exist (CUDA), for RK4 (four solver loops per step), for
 `iterations < 2`, on a `Data` that has never been stepped, or if the recording finds a
-number of solver loops other than one. `stepper.split` and `stepper.reason` report which
-and why; `split=True` turns the decline into an error for tests and benchmarks. A declined
-recording rolls back everything it allocated, so the fallback graph is not poisoned by
-buffers belonging to a discarded capture.
+number of solver loops other than one. It also abandons the split at run time if the first
+eight steps all used more than half their iteration budget, since then there is little dead
+work to skip; it captures the monolithic graph lazily at that point and switches.
+`stepper.split` and `stepper.reason` report which and why; `split=True` turns the decline
+into an error (and pins the split) for tests and benchmarks. A declined recording rolls
+back everything it allocated, so the fallback graph is not poisoned by buffers belonging to
+a discarded capture.
 
 **Batch size adapts.** Chunk graphs are captured at sizes 1, 2, 4, ... 32; each step starts
 from the batch that covered the previous step and doubles, clamped so it never overshoots
@@ -283,41 +286,54 @@ was likewise allocated per solve and read by every iteration, so it is now Data-
 
 Measured on MI350X, warm capture, adaptive batch, **auto policy (no forcing)** -- reference
 is the monolithic warm-captured graph, the current best practice
-(`rocm-tools/stepper_validate.py`, job `amd-16887670`):
+(`rocm-tools/stepper_validate.py`, job `amd-16888525`):
 
 | scene | reference | Stepper | **speedup** | iters/budget | host reads/step |
 |---|---|---|---|---|---|
-| franka_emika_panda | 6.515 ms | **1.711 ms** | **3.81x** | 2 / 100 | 1 |
-| humanoid | 4.876 ms | **1.808 ms** | **2.70x** | 6 / 100 | 2 |
-| aloha_pot | 17.509 ms | **10.322 ms** | **1.70x** | 2 / 100 | 1 |
-| three_humanoids | 12.089 ms | **7.516 ms** | **1.61x** | 3 / 100 | 2 |
-| **aloha_clutter (SLEEP, 22 trees, compact solve)** | 19.135 ms | **12.573 ms** | **1.52x** | 1 / 100 | 1 |
-| unitree_g1_flat | 5.557 ms | 5.634 ms | 0.99x | 8 / 10 | 2 |
-| unitree_g1_hfield | 10.347 ms | 10.471 ms | 0.99x | 10 / 10 | 1 |
+| franka_emika_panda | 6.519 ms | **1.711 ms** | **3.81x** | 2 / 100 | 1 |
+| humanoid | 4.880 ms | **1.813 ms** | **2.69x** | 6 / 100 | 2 |
+| aloha_pot | 17.799 ms | **10.801 ms** | **1.65x** | 2 / 100 | 1 |
+| **aloha_clutter (SLEEP, 22 trees, compact solve)** | 20.461 ms | **12.498 ms** | **1.64x** | 1 / 100 | 1 |
+| three_humanoids | 12.370 ms | **7.597 ms** | **1.63x** | 3 / 100 | 2 |
+| unitree_g1_flat | 5.558 ms | 5.617 ms | 0.99x | 8 / 10 | 2 |
+| unitree_g1_hfield | 10.371 ms | 10.461 ms | 0.99x | 10 / 10 | — (abandoned) |
 
-The two scenes at 0.99x are the honest downside: they use nearly their whole 10-iteration
-budget, so there is nothing to skip and the host read costs ~1%. Everything else is bounded
-by how much of the budget the solve actually needs -- exactly the quantity a conditional
-node would exploit. franka lands just under its independently measured 4.24x ceiling; the
-shortfall is the host read.
+The gain tracks exactly how much of the budget the solve leaves unused -- the quantity a
+conditional node exploits. franka lands just under its independently measured 4.24x
+ceiling; the shortfall is the host read. The two scenes at 0.99x are the honest floor:
+their 10-iteration budget is about right-sized, so there is almost nothing to skip. hfield
+uses all 10 and the run-time calibration abandons the split for it; g1_flat uses 8 of 10,
+which is enough early exit to keep the split but not enough to pay for it.
+
+**End-to-end through `testspeed`** (1000 steps, `--chunked_solver` on vs off, MI350X) --
+this replaces the earlier projection with measured suite numbers:
+
+| scene | chunked off | **chunked on** | ratio | L40S (same harness) | gap before | **gap now** |
+|---|---|---|---|---|---|---|
+| franka_emika_panda | 5,028,269 | **19,301,515** | **3.84x** | 22,208,930 | 4.37x | **1.15x** |
+| humanoid | 1,410,934 | **2,740,697** | **1.94x** | 5,474,229 | 3.92x | **2.00x** |
+| unitree_g1_flat | 1,658,881 | 1,597,235 | 0.96x | 2,119,598 | 1.41x | 1.33x |
+
+franka goes from 4.37x behind an L40S to **1.15x**, humanoid from 3.92x to 2.00x. g1_flat
+loses 4%.
 
 On CUDA the auto policy declines the split, so it is a measured **1.00x on all seven
 scenes** -- the feature cannot regress a platform that already has conditional nodes.
 
 To test the *decomposition* rather than the platform, the same scenes ran on an L40S with
 `opt.graph_conditional` forced off, which makes CUDA unroll the budget exactly as HIP does
-(`STEPPER_FORCE=1`). This is the apples-to-apples check, on a quiet node, and it covers the
+(`STEPPER_UNROLL=1`). This is the apples-to-apples check, on a quiet node, and it covers the
 paths the prototype could not reach:
 
 | scene (L40S, unrolled reference) | reference | Stepper | speedup |
 |---|---|---|---|
-| franka_emika_panda | 6.891 ms | 1.590 ms | **4.33x** |
-| humanoid | 4.211 ms | 1.004 ms | **4.20x** |
-| aloha_pot | 15.552 ms | 4.847 ms | **3.21x** |
-| **aloha_clutter (SLEEP, 22 trees, compact solve)** | 11.007 ms | 4.067 ms | **2.71x** |
-| three_humanoids | 11.648 ms | 6.576 ms | 1.77x |
-| unitree_g1_flat | 4.846 ms | 4.691 ms | 1.03x |
-| unitree_g1_hfield | 8.907 ms | 8.953 ms | 0.99x |
+| franka_emika_panda | 6.896 ms | 1.590 ms | **4.34x** |
+| humanoid | 4.216 ms | 1.009 ms | **4.18x** |
+| aloha_pot | 15.556 ms | 4.851 ms | **3.21x** |
+| **aloha_clutter (SLEEP, 22 trees, compact solve)** | 11.021 ms | 4.087 ms | **2.70x** |
+| three_humanoids | 11.653 ms | 6.577 ms | 1.77x |
+| unitree_g1_flat | 4.844 ms | 4.689 ms | 1.03x |
+| unitree_g1_hfield | 8.886 ms | 9.326 ms | 0.95x (abandoned mid-measurement) |
 
 **Faithfulness.** Every scene is checked against unmodified `mjw.step` over 10 steps from
 an aligned start, against a control of a second independent `mjw.step` run -- the only
@@ -343,17 +359,28 @@ reference by the same amount as `chunk=1` does. The residual is nondeterminism, 
 split.
 
 `mujoco_warp/_src/stepper_test.py` covers trajectory equivalence (default, sleep+islands,
-Euler/implicitfast, fixed chunk), early exit, and all five fallbacks: **14 passed on the
-L40S, 13 passed + 1 principled skip on MI350X** (the conditional-graph fallback test has
-nothing to assert on HIP). The modules the solver refactor touches (solver, sleep, forward,
-island tests): **215 passed on the L40S, 211 passed + 4 skips on MI350X**, zero failures.
+Euler/implicitfast, fixed chunk, capturing `forward` instead of `step`), early exit, the
+calibration hand-off, and every fallback: **16 passed on the L40S** (three consecutive runs,
+no flakes), **15 passed + 1 principled skip on MI350X** (the conditional-graph fallback test
+has nothing to assert on HIP). The modules the solver refactor touches (solver, sleep,
+forward, island): **215 passed on the L40S, 211 passed + 4 skips on MI350X**, zero failures.
+The **full mujoco_warp suite on the L40S with both patches applied: 1,257 passed, 22
+skipped, 0 failed** -- pristine upstream is 1,241 passed / 22 skipped, so that is the same
+1,241 plus the 16 new tests.
+
+**Known gaps.** RK4 falls back (it runs four solver loops; a multi-loop split is possible
+but was not built). The calibration's threshold is a heuristic on iteration counts, not a
+timing measurement, so it catches the clear case (hfield, 10/10) and not the marginal one
+(g1_flat, 8/10, which costs 4% end to end on MI350X and *gains* 3% on the L40S -- the sign
+is platform-dependent, which is why a fixed heuristic cannot get both). Constructing a
+Stepper advances the Data by `warmup` steps; there is no snapshot/restore.
 
 **Opt-in.** `mjw.Stepper(m, d)` -- an object, not a flag, because a captured stepper owns
 graphs with a lifetime and `step()` is deliberately monolithic. Constructing it advances
 `d` by `warmup` steps (default 3) to force the lazy allocations that capture must not make;
-`warmup=0` for an already-stepped `Data`. `cli.unroll` uses it automatically when
-benchmarking `mjw.step` (`--chunked_solver`, default on), so `testspeed` and the benchmark
-suite pick the win up without changes.
+`warmup=0` for an already-stepped `Data`. `fn=` captures something other than `step`
+(`forward`, `step2`). `cli.unroll` uses it automatically (`--chunked_solver`, default on),
+so `testspeed` and the benchmark suite pick the win up without changes.
 
 **Where it belongs: upstream.** The change is vendor-neutral and additive -- `step()` is
 unchanged, the loop indirection is pure code motion, and on CUDA the policy declines the

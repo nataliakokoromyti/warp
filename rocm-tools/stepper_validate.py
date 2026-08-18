@@ -24,10 +24,12 @@ import mujoco_warp as mjw
 from mujoco_warp._src.io import load_trajectory
 from mujoco_warp._src.io import override_model
 
-# Force the unrolled solver loop (what a platform without conditional graph nodes runs)
-# and require the split. Lets the decomposition be validated on CUDA, where the auto
-# policy would otherwise decline it because conditional nodes already do the job.
+# STEPPER_UNROLL=1 turns off conditional graph nodes, which makes CUDA unroll the solver
+# budget exactly as HIP does, so the whole auto policy (including the run-time calibration)
+# can be exercised on either vendor. STEPPER_FORCE=1 also requires the split, which pins
+# the decomposition itself under test and disables the calibration.
 FORCE = os.environ.get("STEPPER_FORCE") == "1"
+UNROLL = FORCE or os.environ.get("STEPPER_UNROLL") == "1"
 
 # (name, mjcf, nworld, nconmax, njmax, extra put_data kwargs, model overrides, init_asleep,
 #  replay npz used only to set the initial state)
@@ -63,7 +65,7 @@ def _make(mjm, mjd, nworld, nconmax, njmax, extra, overrides, init_asleep):
   m = mjw.put_model(mjm)
   if overrides:
     override_model(m, overrides)
-  if FORCE:
+  if UNROLL:
     m.opt.graph_conditional = False
   if init_asleep:
     mjd.tree_asleep[:] = np.arange(mjm.ntree, dtype=np.int32)
@@ -99,7 +101,7 @@ def run(assets_root, idx, chunk):
 
   print(
     f"\n=== {name} nv={mjm.nv} ntree={mjm.ntree} nworld={nworld} "
-    f"iterations={mjm.opt.iterations} chunk={chunk} force={FORCE} ===",
+    f"iterations={mjm.opt.iterations} chunk={chunk} unroll={UNROLL} force={FORCE} ===",
     flush=True,
   )
 
@@ -119,7 +121,8 @@ def run(assets_root, idx, chunk):
   print(f"STEP {name} reference {ref_ms:8.3f} ms/step", flush=True)
   print(
     f"STEP {name} stepper   {st_ms:8.3f} ms/step  speedup={ref_ms / st_ms:5.2f}x  "
-    f"iters/step={st.last_iterations} reads/step={st.last_reads}",
+    f"iters/step={st.last_iterations} reads/step={st.last_reads} split_after={st.split}"
+    f"{'' if st.split else ' (' + st.reason + ')'}",
     flush=True,
   )
 

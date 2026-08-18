@@ -11,7 +11,7 @@ index f43ba86..9dc377e 100644
  from mujoco_warp._src.support import get_state as get_state
  from mujoco_warp._src.support import jac as jac
 diff --git a/mujoco_warp/_src/cli.py b/mujoco_warp/_src/cli.py
-index ae1532f..23535b0 100644
+index ae1532f..372fbc7 100644
 --- a/mujoco_warp/_src/cli.py
 +++ b/mujoco_warp/_src/cli.py
 @@ -15,6 +15,7 @@
@@ -41,10 +41,10 @@ index ae1532f..23535b0 100644
        wp.synchronize_device()
 -      with wp.ScopedCapture() as capture:
 -        fn(*(m, d) if rc is None else (m, d, rc))
-+      if rc is None and fn is mjw.step and CHUNKED_SOLVER.value:
++      if rc is None and fn in (mjw.step, mjw.forward, mjw.step2) and CHUNKED_SOLVER.value:
 +        # Stepper falls back to a single captured graph wherever the split does not
 +        # apply, so this is never worse than capturing fn directly.
-+        stepper = mjw.Stepper(m, d, warmup=0)
++        stepper = mjw.Stepper(m, d, warmup=0, fn=fn)
 +        launch = stepper.step
 +        if stepper.split:
 +          print(f"chunked solver: host-driven solver loop, budget {stepper.iterations} iterations")
@@ -216,10 +216,10 @@ index 4aec496..75bfdf4 100644
    sctx.compact_m_full = m
 diff --git a/mujoco_warp/_src/stepper.py b/mujoco_warp/_src/stepper.py
 new file mode 100644
-index 0000000..3c02b51
+index 0000000..8178717
 --- /dev/null
 +++ b/mujoco_warp/_src/stepper.py
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,382 @@
 +# Copyright 2025 The Newton Developers
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -254,7 +254,9 @@ index 0000000..3c02b51
 +islands, the compact solve, control callbacks, any integrator). Where the split does not
 +apply -- conditional graph nodes available, RK4, no solver loop, more than one solver loop
 +per step -- the stepper falls back to capturing ``step()`` as one graph, which is exactly
-+what a caller would have written by hand.
++what a caller would have written by hand. It also falls back at run time if the first few
++steps show the solver using most of its iteration budget every time, since then there is
++little dead work to skip and the extra graph launches and the host read can cost more.
 +"""
 +
 +from __future__ import annotations
@@ -275,6 +277,14 @@ index 0000000..3c02b51
 +# powers of two up to this value; the step doubles the batch each time it has to go round
 +# again, so a solve that needs n iterations costs O(log n) host reads.
 +_MAX_CHUNK = 32
++
++# Steps to watch before concluding the split is not worth its overhead, and the fraction of
++# the iteration budget a solve has to stay under for at least one of them to be worth
++# keeping. A scene that routinely uses most of its budget has a budget that is about the
++# right size, so there is little dead work for the split to skip -- and the extra graph
++# launches and the host read are then likely to cost more than it saves.
++_CALIBRATION_STEPS = 8
++_CALIBRATION_FRACTION = 0.5
 +
 +
 +class _Unsupported(Exception):
@@ -367,6 +377,11 @@ index 0000000..3c02b51
 +    warmup: Number of steps to run before capturing, to force lazy allocations.
 +    split: ``True`` to require the split (raising if it is not available), ``False`` to
 +      force a single monolithic graph, or ``None`` (default) to choose automatically.
++    fn: The function to capture, ``mujoco_warp.step`` by default. Anything with the same
++      ``(m, d)`` signature and exactly one solver loop works, such as ``forward`` or
++      ``step2``.
++    calibrate: Whether to abandon the split, after watching a few steps, if the solver
++      keeps using most of its iteration budget and the split therefore has little to skip.
 +  """
 +
 +  def __init__(
@@ -376,9 +391,12 @@ index 0000000..3c02b51
 +    chunk: int | None = None,
 +    warmup: int = 3,
 +    split: bool | None = None,
++    fn=None,
++    calibrate: bool = True,
 +  ):
 +    self.m = m
 +    self.d = d
++    self.fn = forward.step if fn is None else fn
 +    self.device = wp.get_device()
 +    self.split = False
 +    self.reason = ""
@@ -389,9 +407,12 @@ index 0000000..3c02b51
 +    self._chunk_graphs = {}
 +    self._sizes = [1]
 +    self._hint = 1
++    # split=True is a promise to the caller that the split is in use, so it opts out of
++    # the calibration that could later abandon it.
++    self._calibrating = _CALIBRATION_STEPS if (calibrate and split is not True) else 0
 +
 +    for _ in range(warmup):
-+      forward.step(m, d)
++      self.fn(m, d)
 +    if warmup:
 +      wp.synchronize_device()
 +
@@ -407,7 +428,7 @@ index 0000000..3c02b51
 +
 +    if not self.split:
 +      with wp.ScopedCapture(device=self.device) as cap:
-+        forward.step(m, d)
++        self.fn(m, d)
 +      self.graph = cap.graph
 +
 +  # -- setup ------------------------------------------------------------------------
@@ -416,7 +437,7 @@ index 0000000..3c02b51
 +    # supports_graph_capture only exists in newer Warp; assume capture works without it.
 +    if not self.device.is_cuda or not getattr(self.device, "supports_graph_capture", True):
 +      raise _Unsupported("device does not support graph capture")
-+    if m.opt.integrator == types.IntegratorType.RK4:
++    if self.fn is forward.step and m.opt.integrator == types.IntegratorType.RK4:
 +      raise _Unsupported("the RK4 integrator runs four solver loops per step")
 +    if m.opt.iterations < 2:
 +      raise _Unsupported(f"nothing to skip at opt.iterations={m.opt.iterations}")
@@ -439,7 +460,7 @@ index 0000000..3c02b51
 +      if wp.capture_begin(device=self.device) is False:
 +        raise _Unsupported("graph capture is disabled on this device")
 +      try:
-+        forward.step(m, d)
++        self.fn(m, d)
 +        post = wp.capture_end(device=self.device)
 +      except Exception:
 +        self._abort_capture()
@@ -510,7 +531,7 @@ index 0000000..3c02b51
 +  # -- stepping ---------------------------------------------------------------------
 +
 +  def step(self):
-+    """Advance the simulation by one step. Equivalent to ``mjw.step(m, d)``."""
++    """Run the captured function once. Equivalent to calling ``fn(m, d)`` directly."""
 +    if not self.split:
 +      wp.capture_launch(self.graph)
 +      return
@@ -549,6 +570,31 @@ index 0000000..3c02b51
 +
 +    wp.capture_launch(self.graph_post)
 +
++    if self._calibrating:
++      self._calibrate(done, budget)
++
++  def _calibrate(self, done: int, budget: int):
++    """Give up on the split if it has little to skip.
++
++    The split only pays by ending the solver early. When a scene keeps using most of its
++    iteration budget the saving is small and the extra graph launches and the host read
++    can cost more, so watch the first few steps and switch to a single captured graph --
++    what a caller would have written anyway -- if none of them left much on the table.
++    """
++    self._calibrating -= 1
++    if done < _CALIBRATION_FRACTION * budget:
++      self._calibrating = 0  # the split is paying for itself; stop watching
++      return
++    if self._calibrating:
++      return
++    with wp.ScopedCapture(device=self.device) as cap:
++      self.fn(self.m, self.d)
++    self.graph = cap.graph
++    self.graph_pre = self.graph_post = None
++    self._chunk_graphs = {}
++    self.split = False
++    self.reason = f"the solver used most of its {budget}-iteration budget on every calibration step"
++
 +  def _pick(self, want: int, remaining: int) -> int:
 +    """The largest captured batch size that is neither above ``want`` nor overshoots the
 +    remaining budget by a whole batch."""
@@ -558,10 +604,10 @@ index 0000000..3c02b51
 +  __call__ = step
 diff --git a/mujoco_warp/_src/stepper_test.py b/mujoco_warp/_src/stepper_test.py
 new file mode 100644
-index 0000000..0a0cf7c
+index 0000000..e443a31
 --- /dev/null
 +++ b/mujoco_warp/_src/stepper_test.py
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,235 @@
 +# Copyright 2025 The Newton Developers
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -696,6 +742,23 @@ index 0000000..0a0cf7c
 +    stepper, _ = self._compare(mjm)
 +    self.assertTrue(stepper.split)
 +
++  def test_captures_forward(self):
++    """Any (m, d) function with one solver loop can be captured, not just step."""
++    mjm, mjd, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    m = _unrolled(mjw.put_model(mjm))
++    d_ref = mjw.put_data(mjm, mjd, nworld=4)
++    d_run = mjw.put_data(mjm, mjd, nworld=4)
++    for _ in range(3):
++      mjw.forward(m, d_ref)
++      mjw.forward(m, d_run)
++    wp.synchronize_device()
++    stepper = mjw.Stepper(m, d_run, warmup=0, split=True, fn=mjw.forward)
++    mjw.forward(m, d_ref)
++    stepper.step()
++    wp.synchronize_device()
++    scale = max(np.abs(d_ref.qacc.numpy()).max(), 1.0)
++    self.assertLessEqual(np.abs(d_run.qacc.numpy() - d_ref.qacc.numpy()).max(), _RTOL * scale)
++
 +  def test_early_exit(self):
 +    """The loop must stop just after convergence rather than replaying the whole budget."""
 +    mjm, _, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
@@ -733,6 +796,26 @@ index 0000000..0a0cf7c
 +    stepper = mjw.Stepper(m, d)
 +    self.assertFalse(stepper.split)
 +    self.assertIn("conditional", stepper.reason)
++
++  def test_calibration_abandons_a_split_that_never_pays(self):
++    """A model that always uses its whole budget should end up on the monolithic graph."""
++    mjm, mjd, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    mjm.opt.iterations = 4
++    m = _unrolled(mjw.put_model(mjm))
++    d = mjw.put_data(mjm, mjd, nworld=4)
++    # a batch as big as the budget can never end the solver early, whatever the scene does
++    stepper = mjw.Stepper(m, d, chunk=int(mjm.opt.iterations))
++    self.assertTrue(stepper.split)
++    for _ in range(12):
++      stepper.step()
++    wp.synchronize_device()
++    self.assertFalse(stepper.split)
++    self.assertIn("budget", stepper.reason)
++    # and the monolithic graph it swapped in is a working step
++    before = d.time.numpy().copy()
++    stepper.step()
++    wp.synchronize_device()
++    np.testing.assert_allclose(d.time.numpy(), before + mjm.opt.timestep, rtol=1e-6)
 +
 +  def test_fallback_cold_data(self):
 +    """A Data that has never stepped cannot supply a host-readable convergence counter."""
