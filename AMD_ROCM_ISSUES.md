@@ -106,7 +106,43 @@ the process.
 
 ---
 
-## 4. Minor divergences from CUDA semantics
+## 4. Under investigation: an in-capture free on a temporary stream faults the GPU
+
+*Reported here for visibility; we have not yet established whether the bug is in ROCm or in
+our own HIP capture path, so treat it as a question rather than a filing.*
+
+Warp's `test_cuda_graph_alloc_transient_stream` builds this graph on MI350X / ROCm 7.2:
+
+1. begin capture on the device stream;
+2. inside the capture, open a **temporary** side stream, allocate two 256 MB arrays from the
+   memory pool, run 100 kernels over them, then let one array go out of scope so it is
+   **freed inside the capture**;
+3. inside the capture, open a second temporary side stream and copy a pinned host buffer
+   into a third allocation;
+4. end capture and launch.
+
+Result:
+
+```
+Memory access fault by GPU node-2 (Agent handle: 0x3d950a40) on address 0xf9aee82c000.
+Reason: Unknown.
+```
+
+The same test passes on CUDA — it exists specifically to catch a free that is ordered on the
+wrong stream and therefore releases memory another stream is still reading. What we would
+like to know from AMD: are stream-ordered mempool free nodes captured into a hipGraph
+required to carry a dependency on the allocating stream's pending work, and if so is that
+dependency honored when the allocating stream is destroyed before the graph is launched?
+
+We order the free after the allocation with an event recorded on the allocating stream
+(`hipEventRecord` on the alloc stream, `hipStreamWaitEvent` on the free stream) — the same
+construction CUDA is happy with. Repro: remove the `not d.is_hip` filter at the top of
+`warp/tests/test_graph.py` and run
+`python warp/tests/test_graph.py TestGraph.test_cuda_graph_alloc_transient_stream_cuda_0`.
+
+---
+
+## 5. Minor divergences from CUDA semantics
 
 Lower priority, but each cost us debugging time and forced a workaround:
 

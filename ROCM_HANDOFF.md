@@ -535,7 +535,9 @@ covers, in value order: (1) hipGraph **conditional node** support, worth a measu
 on franka / 3.38x on humanoid; (2) graph **allocation nodes replay ~20x worse than CUDA**
 (2.20x vs 1.06x cold/warm penalty); (3) the **stuck invalidated capture** bug, already
 fixed on clr `develop` as `fa77aed` but unreleased — ask for a 7.2.x backport;
-(4) minor CUDA-semantics divergences. Original working notes below.
+(4) the **in-capture free GPU fault** (open, ownership unresolved); (5) minor
+CUDA-semantics divergences, now including the HSA uint32 dispatch ceiling and cross-process
+IPC. Original working notes below.
 
 ### Original working notes
 
