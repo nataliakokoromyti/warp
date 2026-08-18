@@ -442,12 +442,27 @@ That is ~110,000 readbacks across every single-process shape we could think of, 
 heavy pool churn and the literal failing configuration, with nothing. Meanwhile the full
 suite trips it in ~60% of runs.
 
-**The remaining difference is process-level concurrency.** The suite runner executes ~16
-test classes in *parallel processes* sharing one GPU; every probe above is one process
-(the `--load` variants add background processes, but doing unrelated d2d work).
-`rocm-tools/slurm/` has a job that runs 8 and 16 concurrent copies of the failing
-configuration to test exactly that. If it reproduces, the bug is in how ROCm handles
-concurrent multi-process memory-pool traffic on one device, and that is what to hand AMD.
+**The missing variable was process-level concurrency, and that reproduces it.** The suite
+runner executes ~16 test classes in *parallel processes* sharing one GPU; every probe above
+is a single process. Running **8 concurrent `copy_repro.py` processes** against one MI350X:
+
+```
+CONCURRENT_K=8   processes_reporting_mismatch = 5/8
+    FAIL indexed2contiguous_OwnStream_Graph: 6/1500 mismatches
+    {'first_mismatch': 256, 'total_mismatch': 125184, ...}   <- every occurrence
+```
+
+So there is now a **standalone reproducer that does not need the test suite**: eight
+concurrent processes doing the failing copy, ~1 in 1,500-10,000 iterations per process.
+
+The signature is startlingly *deterministic* -- every single occurrence, across six hits in
+one process and across different processes, reports the identical `first_mismatch = 256`
+and `total_mismatch = 125,184`. A timing race would scatter those numbers. This looks like
+a structural corruption whose *trigger* is contention rather than a race whose *extent* is
+random, which is a much more tractable bug. `rocm-tools/copy_repro.py` now reports which
+side is wrong (both arrays are compared against the values actually uploaded), the run and
+stride structure of the damage, and whether a full device synchronize repairs it -- the
+last of which separates a lost transfer from a corrupt device buffer.
 
 **Assessment**: real, reproduces at roughly **50% per full-suite run**, and it **silently
 corrupts data Warp hands back to the user**. This is now the most serious open item in the
