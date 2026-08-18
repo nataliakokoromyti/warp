@@ -507,10 +507,10 @@ it does not (`rocm-tools/slurm/col_sdf_round3.sbatch`):
 | + static octree index | 259.95 (1.2%) | 144.26 (6.0%) |
 | + static octree index, prints removed | **18.84 (14% over prints-removed alone)** | 37.30 |
 
-Stacked, `_sdf_narrowphase` goes **263.0 ms -> 18.84 ms, 14.0x**, against the L40S's 16.53 ms
-for the same isolated kernel: **1.14x, effectively parity**. Repeat controls in this job
-agree to 0.5%, and the three jobs that measured the stock configuration independently landed
-on 263.50 / 262.47 / 263.05 / 264.39.
+Stacked, `_sdf_narrowphase` goes **263.0 ms -> 18.84 ms, 14.0x** (see the closing table for
+the L40S comparison). Repeat controls in this job agree to 0.5%, and the four measurements of
+the stock configuration across three independent jobs landed on 263.50 / 262.47 / 263.05 /
+264.39.
 
 So the ranked fix list for the one genuinely AMD-hostile collision kernel is: compile out the
 device prints (12.0x), then the static octree index (a further 1.16x), and `__launch_bounds__`
@@ -574,11 +574,13 @@ investigation:
 | stock | 235.5 - 263.5 | 16.45 | **14.3 - 16.0x** |
 | patched | **18.74** | 16.05 | **1.17x** |
 
-`aloha_sdf` end to end goes from **8.48x behind the L40S to 3.92x**, and the residue is no
-longer collision -- the collision kernel is at parity. Where the remaining 3.9x lives is now
-a question for the solver bucket (this scene budgets 100 solver iterations with an elliptic
-cone and converges in ~3), and it is worth re-running the `opt.iterations` control on it now
-that collision no longer swamps everything else.
+`aloha_sdf` end to end goes from **8.48x behind the L40S to 3.92x**. The remaining 3.9x is
+**not attributed yet** -- the kernel that used to be 87% of the step is now within 17% of the
+L40S in the isolated harness, so whatever dominates the benchmark's (heavier, more-contact)
+state is something else. Redo the phase split on the patched build before guessing; the
+`opt.iterations` control is the obvious first suspect, since this scene budgets 100 solver
+iterations with an elliptic cone and converges in ~3, and that control was previously
+meaningless here only because collision swamped it.
 
 **Next lead, unexplored:** mujoco_warp has **28 device prints** in total, and the file with
 the most is `collision_flex.py` (**9**) -- the cloth family, which is separately known to be
