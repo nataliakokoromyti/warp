@@ -416,7 +416,7 @@ capability skips shared with CUDA:
 | suite | HIP-skipped | verdict |
 |---|---|---|
 | `deterministic/*` (4 modules) | 76 | genuine; the deterministic subsystem is unported (see below) |
-| `test_graph.py` | 20 | **suspect** -- gate reads "HIP/ROCm does not support native CUDA graph capture", inherited from AMD's base where capture was disabled. `rocm-117` enables capture, so this hides 20 tests in exactly the area we changed most, including the `_depends_on`/`_nodes_independent` graph *topology* tests. |
+| `test_graph.py` | 20 | **hides a hard GPU crash -- see below** |
 | `cuda/test_texture.py` | 19 | genuine (CDNA has no texture hardware; the CPU sampling fallback is covered separately) |
 | `cuda/test_cluster_dim.py` | 8 | genuine (no thread block clusters) |
 | `cuda/test_clang_cuda.py` | 7 | genuine (emits PTX/CUDA that cannot load on gfx) |
@@ -425,6 +425,47 @@ capability skips shared with CUDA:
 | `test_fast_math.py` | 2 | genuine (fast-math `powf(-2,2)` divergence, PTX inspection) |
 | `cuda/test_ipc.py` | 2 | gate is correct, reason was not -- see below |
 | `test_bf16.py` | 1 | needs two devices |
+
+### `test_graph.py`: the gate hides a GPU memory fault (2026-08-18)
+
+The exclusion reads *"HIP/ROCm does not support native CUDA graph capture"*. It was
+inherited from AMD's base, where capture was disabled; `rocm-117` enables capture, so the
+comment is simply false and 20 tests stop running in the area this port changed most.
+
+Removing it and running the file on MI350X:
+
+```
+test_cuda_graph_alloc_free_preserves_merged_frontier_cuda_0 ... ok
+test_cuda_graph_alloc_transient_stream_cuda_0 ... Memory access fault by GPU node-2
+    (Agent handle: 0x3d950a40) on address 0xf9aee82c000. Reason: Unknown.
+```
+
+`test_cuda_graph_alloc_transient_stream` allocates inside a capture on a *temporary* side
+stream, lets one array go out of scope so it is freed inside the capture, and then checks
+the results. Its own comment states the hazard it exists to catch:
+
+> Array `b` goes out of scope here and is freed. If the free runs on an incorrect stream,
+> the memory could be released prematurely. Other streams that are allocating memory could
+> then reuse the memory while it is still used on this stream, leading to data corruption.
+
+On MI350X it does not merely corrupt -- it faults the GPU. **This is a real bug the gate
+was hiding, and it is the strongest lead for the two intermittents**: a mis-ordered
+mempool free hands a still-live buffer to a later allocation, and the milder form of that
+is precisely "the buffer reads back partly zero" (every async-copy test allocates its
+destination from `np.zeros`, so a stale in-flight zero-fill landing on recycled memory
+produces the observed zero prefix).
+
+Where to look: `warp.cu` orders in-capture frees after their allocation with the
+allocating stream's **`cached_event`** (`cuEventRecord(alloc_si->cached_event, alloc_stream)`
+then `cuStreamWaitEvent(free_stream, ...)`, three sites around lines 647 / 1070 / 1229).
+That is one reused event per stream; the pattern is safe under CUDA's event semantics and
+is the first thing to check against HIP's.
+
+Status: a per-test isolated sweep (`rocm-tools/isolate_tests.py`, one process per test so
+the first fault does not hide the rest) enumerates which of the 20 pass, fail, or crash.
+**Do not re-enable the suite until the fault is fixed** -- a crash aborts the whole test
+process. But do not leave the gate labelled "capture unsupported" either; it is now
+labelled as covering a known fault.
 
 The two IPC tests were re-run with the gate removed: both genuinely fail on MI350X.
 `hipIpcOpenMemHandle` returns `hipErrorInvalidValue` for a handle exported by another
