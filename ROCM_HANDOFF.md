@@ -434,16 +434,20 @@ It also narrows the trigger, by *not* reproducing:
 | same, without rewriting between reads (control) | **0 corrupt** |
 | same, into a **pinned** destination | **0 corrupt** |
 | same, with 2 background GPU-load processes | **0 corrupt** |
+| `--churn 4`: 4 fresh pool buffers allocated, written, read, freed per iteration | **0 / 20,000** |
+| `copy_repro.py` -- the exact failing test configuration | **0 / 6,000** |
+| `copy_repro.py --variants all` -- 32 configurations | **0 / 6,400** |
 
-80,000 readbacks of a **long-lived** buffer are clean. So it is not simply "a 4 MB D2H
-sometimes drops chunks". What the failing tests do that this does not is **churn the memory
-pool**: every async-copy test allocates fresh multi-MB buffers (`wp.zeros`, which is an
-allocation plus a zero-fill), copies into them, reads them back once, and frees them --
-thousands of times per run. That makes a stream-ordered-allocator hazard the live
-hypothesis: a block handed to a new owner while a previous owner's zero-fill is still in
-flight would land exactly this damage -- whole aligned blocks of zeros, in a buffer the new
-owner has already written. The `--churn` mode probes that, and it is the same class of bug
-as the in-capture-free GPU fault documented below.
+That is ~110,000 readbacks across every single-process shape we could think of, including
+heavy pool churn and the literal failing configuration, with nothing. Meanwhile the full
+suite trips it in ~60% of runs.
+
+**The remaining difference is process-level concurrency.** The suite runner executes ~16
+test classes in *parallel processes* sharing one GPU; every probe above is one process
+(the `--load` variants add background processes, but doing unrelated d2d work).
+`rocm-tools/slurm/` has a job that runs 8 and 16 concurrent copies of the failing
+configuration to test exactly that. If it reproduces, the bug is in how ROCm handles
+concurrent multi-process memory-pool traffic on one device, and that is what to hand AMD.
 
 **Assessment**: real, reproduces at roughly **50% per full-suite run**, and it **silently
 corrupts data Warp hands back to the user**. This is now the most serious open item in the
