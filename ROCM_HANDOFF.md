@@ -467,8 +467,13 @@ then `cuStreamWaitEvent(free_stream, ...)`, three sites around lines 647 / 1070 
 That is one reused event per stream; the pattern is safe under CUDA's event semantics and
 is the first thing to check against HIP's.
 
+L40S control, same file un-gated, stock Warp 1.16, one process per test: **27 PASS / 0 FAIL
+/ 0 CRASH / 4 SKIP**, including all 16 alloc/free graph-topology tests and the transient-
+stream test. So these tests are all meant to pass and the fault is HIP-side.
+
 Status: a per-test isolated sweep (`rocm-tools/isolate_tests.py`, one process per test so
-the first fault does not hide the rest) enumerates which of the 20 pass, fail, or crash.
+the first fault does not hide the rest) enumerates which of the 27 pass, fail, or crash
+on MI350X.
 **Do not re-enable the suite until the fault is fixed** -- a crash aborts the whole test
 process. But do not leave the gate labelled "capture unsupported" either; it is now
 labelled as covering a known fault.

@@ -129,7 +129,9 @@ Reason: Unknown.
 ```
 
 The same test passes on CUDA — it exists specifically to catch a free that is ordered on the
-wrong stream and therefore releases memory another stream is still reading. What we would
+wrong stream and therefore releases memory another stream is still reading. Running the
+whole file one-process-per-test on an L40S with stock Warp 1.16 gives 27 pass / 0 fail /
+0 crash, so every test in it is expected to hold. What we would
 like to know from AMD: are stream-ordered mempool free nodes captured into a hipGraph
 required to carry a dependency on the allocating stream's pending work, and if so is that
 dependency honored when the allocating stream is destroyed before the graph is launched?
