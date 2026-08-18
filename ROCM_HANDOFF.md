@@ -406,8 +406,8 @@ suite as proof. Leading candidate, found in the gate audit later the same day:
 after the work still reading the buffer lets a later allocation reuse live memory; the
 severe form is the GPU fault that test produces on MI350X, and the mild form is exactly
 this -- a destination that reads back partly zero, because every async-copy test builds its
-destination from `np.zeros` and a stale in-flight zero-fill landing on recycled memory
-produces the observed prefix. Chase that first. Secondary candidate: reuse of Warp's
+destination by copying `np.zeros` into it, so a stale in-flight write of zeros landing on
+recycled memory produces exactly the observed prefix. Chase that first. Secondary candidate: reuse of Warp's
 per-stream `cached_event` (one event per stream, re-recorded on every
 `wait_stream`/`ScopedStream` entry, and used for exactly this alloc/free ordering) -- legal
 under CUDA's event semantics, worth verifying against HIP's.
@@ -462,9 +462,9 @@ the results. Its own comment states the hazard it exists to catch:
 On MI350X it does not merely corrupt -- it faults the GPU. **This is a real bug the gate
 was hiding, and it is the strongest lead for the two intermittents**: a mis-ordered
 mempool free hands a still-live buffer to a later allocation, and the milder form of that
-is precisely "the buffer reads back partly zero" (every async-copy test allocates its
-destination from `np.zeros`, so a stale in-flight zero-fill landing on recycled memory
-produces the observed zero prefix).
+is precisely "the buffer reads back partly zero" (every async-copy test initializes its
+destination by copying `np.zeros` into it, so a stale in-flight write of zeros landing on
+recycled memory produces the observed zero prefix).
 
 **Read of the root cause** (`warp/native/warp.cu`, `wp_free_device_async`, the graph-alloc
 branch). The two backends order an in-capture free very differently:
