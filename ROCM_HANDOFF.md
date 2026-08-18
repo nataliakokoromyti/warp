@@ -431,6 +431,46 @@ but its downside is nil: of 40 code objects in an `aloha_sdf` kernel cache 8 spi
 after `_sdf_narrowphase`'s 465 the next worst are `linesearch_iterative` (10) and
 `primitive_narrowphase` (7). It removes a cliff rather than lifting a floor.
 
+**The bigger half of the kernel's cost is six device `printf`s.** `collision_sdf.py` carries
+six `wp.printf` / `wp.print` error diagnostics inside `find_oct`, `sdf` and `sdf_grad` --
+unreachable-error paths, buried under a deeply inlined call tree. On HIP `printf` lowers to
+an OCKL **hostcall**, which the compiler must treat as an opaque, memory-clobbering call: it
+materialises a varargs buffer at each site and forces live values across it. Six of them
+inside the octree walk is what drives the register demand in the first place. Timing the
+kernel on its own (`collision_bench.py`, isolated `sdf_narrowphase`, ms/call,
+`rocm-tools/slurm/col_sdf_kernel_sweep.sbatch`):
+
+| variant | stock body | prints removed |
+|---|---|---|
+| no `__launch_bounds__` (control x2) | 263.50 / 262.47 | **21.96 / 21.90** |
+| `__launch_bounds__(64)` | 145.68 | 32.67 |
+| `__launch_bounds__(256)` | 154.13 | 38.82 |
+| `__launch_bounds__(512)` | 155.41 | -- |
+| `__launch_bounds__(1024)` | **255.25** | -- |
+| `__launch_bounds__(256, 2)` | 146.90 | -- |
+
+Removing the prints is worth **12.0x on the kernel** -- against the L40S's 16.53 ms for the
+same isolated kernel in the same harness, that moves MI350X from **15.9x slower to 1.33x
+slower**. Repeat controls agree to 0.4%, and the `__launch_bounds__(1024)` row is the
+internal control that pins the mechanism: 1024 *is* the value the compiler already assumed,
+and declaring it explicitly buys nothing.
+
+The two fixes are not additive, they are alternatives, and the register data says why
+(`rocm-tools/hsaco_regs.py`):
+
+| build | max_flat_wg | vgpr | agpr | vgpr spills | scratch |
+|---|---|---|---|---|---|
+| stock | 1024 | 128 | 0 | **465** | 21,088 |
+| stock + `__launch_bounds__(256)` | 256 | 465 | 209 | 0 | 19,104 |
+| prints removed | 1024 | 128 | 0 | 93 | 8,820 |
+| prints removed + `__launch_bounds__(256)` | 256 | 345 | 89 | 0 | 7,636 |
+
+Once the prints are gone the kernel nearly fits in 128 VGPRs (93 spills), and raising the
+cap then *costs* 1.8x: at 345+89 registers occupancy collapses to about one wave per SIMD,
+and that is worse than paying for 93 cheap spills. So the launch-bounds default is a
+guardrail against the cliff, not a free win everywhere -- worth keeping in mind if a future
+Warp kernel regresses on ROCm.
+
 Also refuted this round: `rocprofv3 --kernel-trace` is unusable on a captured mujoco_warp
 run -- it hangs on `aloha_sdf` and segfaults with `--output-format csv` (matching the known
 `--stats` hang). Use `collision_bench.py` / the event trace instead.
