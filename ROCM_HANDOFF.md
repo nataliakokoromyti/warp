@@ -484,18 +484,23 @@ Read that carefully:
   `src_bad` in others), and it happens with and without graph capture, on the device stream
   and on a user stream.
 
-**MI350X is an 8-XCD part** (CDNA4: 8 accelerator complex dies, 32 CUs each) and in SPX
-mode workgroups are distributed round-robin across the XCDs. "Every 8th workgroup produced
-nothing" is "one XCD's share of the launch produced nothing".
+In bytes that is **1 KB missing out of every 8 KB**. MI350X is an 8-XCD part (CDNA4, and
+this machine runs Compute Partition **SPX** / Memory Partition **NPS1**), so "every 8th
+workgroup" looked at first like "one XCD's share of the launch". **That reading is wrong**:
+`rocm-tools/block_dropout.py` launches a trivial `a[tid] = 1.0` kernel into a
+device-allocated buffer and is clean over **29,000 launches across 8 concurrent
+processes**. A launch does not simply lose workgroups.
 
-If that reading is right, the implication is much larger than a flaky test: **under
-multi-process contention, a kernel launch on MI350X can silently lose 1/8 of its
-workgroups**, which would corrupt any computation, not just copies.
-`rocm-tools/block_dropout.py` tests exactly that with a trivial `a[tid] = 1.0` kernel and
-reports the missing block indices and their residue mod 8 -- if a plain write kernel loses
-blocks the same way, this is a runtime/hardware scheduling bug and belongs with AMD
-immediately. Also worth capturing when reproducing: `rocm-smi --showcomputepartition`
-(SPX/DPX/CPX mode) and the number of concurrent processes on the device.
+What every failing case *does* have, and the clean probe did not, is a **multi-megabyte
+pageable host-to-device copy immediately before the kernel** -- `wp.array(data=numpy_array)`
+builds every one of these buffers -- and the surviving wrong bytes are exactly the H2D
+source values (zeros). So the live explanation is that **a chunked pageable H2D can complete
+after the kernel the stream ordered behind it**, with the split's interleave granularity
+showing up as the 1 KB / 8 KB lattice. `block_dropout.py --h2d-init` is the discriminating
+experiment: same kernel, but the buffer initialized by an H2D copy instead of a device fill.
+
+Whatever the final mechanism, the user-visible statement is already solid and serious:
+**on MI350X under multi-process load, Warp can silently return partly stale data.**
 
 **Assessment**: real, reproduces at roughly **50% per full-suite run**, and it **silently
 corrupts data Warp hands back to the user**. This is now the most serious open item in the
