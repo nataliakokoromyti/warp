@@ -12,6 +12,49 @@ Everything below is reproducible with scripts in `rocm-tools/` of the branch abo
 
 ---
 
+## 0. Correctness bug (highest severity): a kernel launch silently loses 1 workgroup in 8
+
+**Under multi-process contention on one MI350X, a kernel launch can complete "successfully"
+while one thread block in every eight has written nothing.** No error is reported anywhere:
+no launch error, no sticky error, no HSA exception. The missing output is simply absent, and
+a full `hipDeviceSynchronize` plus re-read does not repair it -- the writes never landed.
+
+This was found chasing an intermittent Warp test failure and only resolved once the damage
+was described structurally rather than counted. On a 1,000,000-element float32 array written
+by a kernel launched with 256 threads per block:
+
+```
+runs of bad elements : 489
+length of every run  : 256          <- exactly one thread block's output
+stride between runs  : 2048         <- exactly eight blocks
+value in every run   : 0.0          <- never written
+repaired by sync     : no
+```
+
+Every corrupted-element count we have ever seen falls out of that: 489x256 = 125,184;
+488x256 = 124,928; 488x256+64 = 124,992 (partial final block). Only the phase varies
+between occurrences (first bad block at 0, 256, 512, 1792, 12288, ...). MI350X is an
+8-XCD part and distributes workgroups round-robin across XCDs in SPX mode, so "every 8th
+workgroup" is "one XCD's share of the launch".
+
+**Trigger**: process-level concurrency on a single device. One process is clean over 6,000
+iterations; **eight concurrent processes doing the same work hit it in 5-7 of 8**, at
+roughly one launch in 1,500-10,000 per process. Nothing about the kernel matters -- it
+reproduces with and without graph capture, on the device's stream and on a user stream, and
+on whichever buffer a kernel most recently wrote.
+
+**Impact for us**: a full Warp test suite run trips it in ~60% of runs, and it is a silent
+wrong-answer bug, not a crash. Any multi-tenant MI350X workload -- which is the normal way
+these machines are used -- is exposed.
+
+**Repro**: `rocm-tools/block_dropout.py` (a trivial `a[tid] = 1.0` kernel, reporting missing
+block indices and their residue mod 8) and `rocm-tools/copy_repro.py`; run eight copies
+concurrently against one GPU. Please tell us what to capture on our side --
+`rocm-smi --showcomputepartition`, queue counts, `GPU_MAX_HW_QUEUES` -- and whether a
+compute-partition mode or a known scheduler fix changes it.
+
+---
+
 ## 1. Feature request (highest value): hipGraph conditional nodes
 
 **What's missing**: CUDA 12.4+ exposes conditional graph nodes (`cudaGraphAddNode` with
