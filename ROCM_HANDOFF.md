@@ -552,8 +552,10 @@ are exact. State drift after one step is 1.6e-7 in `qpos` -- about 17x the run-t
 which is what changing register pressure and FMA contraction does to a chaotic contact
 solve, not a semantic change.
 
-Test suites, both green: **Warp 8,294 tests, `OK (skipped=240)`** with the codegen change on
-(`rocm-tools/slurm/col_validate_warp.sbatch`) -- identical to the branch baseline.
+Test suite, with the control run in the same job
+(`rocm-tools/slurm/col_validate_warp.sbatch`): the Warp suite is **8,294 tests,
+`OK (skipped=240)`** both with the codegen change on (683 s) and off (696 s) -- identical to
+each other and to the branch baseline.
 
 **Both mujoco_warp fixes are upstream candidates, not ROCm workarounds.** The same patched
 source on an L40S (`rocm-tools/slurm/col_sdf_nv_ab.sbatch`) is slightly *faster*, never
