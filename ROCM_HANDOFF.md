@@ -402,7 +402,11 @@ single boundary. Both failing tests fail inside `assert_np_equal(dst.numpy(), ..
 
 So the suspect is now the **device-to-host readback itself** (`array.numpy()` ->
 `hipMemcpyAsync` D2H into pageable host memory, which ROCm stages in chunks), not stream or
-graph ordering. `rocm-tools/d2h_integrity.py` hammers exactly that -- tens of thousands of
+graph ordering. Note that `copy_template` calls `wp.synchronize_stream()` before the
+assertion, so the producing kernel has already been waited on at the host -- which argues
+the loss is inside the transfer (dropped or stale chunks) rather than a plain race against
+an unfinished kernel. The probe distinguishes the two: after any corrupt readback it
+re-reads with a full device synchronize and reports whether the device buffer was intact. `rocm-tools/d2h_integrity.py` hammers exactly that -- tens of thousands of
 readbacks, printing the run/stride structure of any corruption, with pinned-destination and
 background-load variants to localize it.
 
