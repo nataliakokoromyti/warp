@@ -103,10 +103,41 @@ def case_control(device, a, spin):
     return a.numpy()
 
 
+def stress(device, sizes, spin, iters):
+    """Hammer the plain launch-then-.numpy() pattern across buffer sizes.
+
+    The FEM failure was a 9-element read (correct prefix, zero suffix) and the
+    async-copy failure a 1M-element read (zero prefix, correct suffix), so the
+    race may only open at particular transfer sizes.
+    """
+    print(f"\nstress: {iters} iterations per size, spin={spin}", flush=True)
+    bad_total = 0
+    for n in sizes:
+        a = wp.zeros(n, dtype=wp.float32, device=device)
+        wp.launch(slow_write, dim=n, inputs=[a, spin], device=device)
+        wp.synchronize_device(device)
+        bad = 0
+        sample = None
+        for _ in range(iters):
+            a.zero_()
+            wp.synchronize_device(device)
+            wp.launch(slow_write, dim=n, inputs=[a, spin], device=device)
+            rep = zeros_report(a.numpy())
+            if rep is not None:
+                bad += 1
+                sample = sample or rep
+            wp.synchronize_device(device)
+        status = "OK  " if bad == 0 else "TORN"
+        print(f"{status} stress_n={n}: {bad}/{iters} torn reads {sample or ''}", flush=True)
+        bad_total += bad
+    return bad_total
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--spin", type=int, default=200000)
     parser.add_argument("--trials", type=int, default=20)
+    parser.add_argument("--stress-iters", type=int, default=0, help="extra per-size stress iterations")
     args = parser.parse_args()
 
     wp.init()
@@ -147,6 +178,9 @@ def main():
         for s in samples:
             print(f"       {s}", flush=True)
         bad_total += bad
+
+    if args.stress_iters:
+        bad_total += stress(device, [9, 1024, 1 << 16, 1 << 20], args.spin // 20, args.stress_iters)
 
     print(f"\ntotal torn reads: {bad_total}")
     return 1 if bad_total else 0

@@ -361,9 +361,49 @@ wide, while reducing blocks resident per CU. Tool: `rocm-tools/blockdim_tune.py`
   decorator argument — changing it silently reuses the old binary. Worth an upstream fix
   (nvidia/warp); we hash-bust with source comments in the compat patch meanwhile.
 - **Intermittent watch**: two different single-test suite failures across runs
-  (`test_copy_i2c_...Graph...`, `test_implicit_fields`), both exact-value partial-write
-  signatures, each passing in other runs (suite is otherwise 8,294-green). Needs a
-  dedicated flake-hunt (run those classes ~50×) before trusting or chasing.
+  (`test_copy_i2c_...Graph...`, `test_implicit_fields`) — **superseded**, see "The two
+  intermittent suite failures" above for the recovered signatures and the flake hunt.
+
+## The two intermittent suite failures -- characterized (2026-08-18)
+
+Both were recovered from the archived suite logs, and they are **the same failure mode**,
+not two unrelated flakes: a **torn device-to-host read**. Warp's `array.numpy()` issues its
+D2H copy on the device's null stream and never explicitly synchronizes -- it relies on
+CUDA's legacy null-stream ordering plus the documented rule that a D2H copy into *pageable*
+host memory returns only once it has completed.
+
+| | test | signature |
+|---|---|---|
+| `suite117-full-16811062` | `test_copy_i2c_d2d_SrcPoolOn_DstPoolOff_Stream0_NoGrad_Graph_AccessDstSrc` | 125,184 / 1,000,000 mismatched -- a **zero prefix**, correct suffix |
+| `suite117-full-16812542` | `test_implicit_fields` | 3 / 9 mismatched -- correct prefix, **zero suffix** (`[5,5,5,5,5,5,0,0,0]`) |
+
+The two directions are consistent with one cause. A D2H DMA walks the buffer front to
+back, so a reader that starts too early on a large buffer returns a zero *prefix*; a small
+buffer copied in one shot instead captures whichever elements the producing kernel had
+written, giving a zero *suffix*. Neither is a lost write.
+
+**What was tested and did not reproduce it** (all on MI350X, rocm-117; every probe is in
+`rocm-tools/` and each has a clean L40S control):
+
+| probe | result |
+|---|---|
+| `capture_fork_join.py` -- does a captured cross-stream fork/join (the shape `wp.copy()` builds for non-contiguous arrays) actually order? | **PASS**, 20/20. A 27 ms kernel on the forked branch makes `synchronize_stream()` block the full 27 ms, so the join edge is honored. |
+| `null_stream_sync.py` -- 7 shapes of "produce on one stream, read with `.numpy()`, no explicit sync", including graph replay with no sync at all | **0 torn reads / 25 trials each**, both vendors. HIP's null-stream ordering and unpinned-D2H blocking both behave like CUDA's. |
+| `copy_repro.py` -- the exact failing copy configuration, 300 iterations, plus all 32 non-contiguous d2d variants | **0 mismatches**, both vendors. |
+| `flake_hunt.py --test fem_implicit` -- 500 iterations, then 300 more with 3 background GPU-load processes | **0 failures**, both vendors. |
+
+So the mechanism is identified but the trigger is not: it needs the full parallel suite
+(~16 test classes across processes sharing one GPU), which is the only context in which
+either failure has ever been seen. Base rate from the archive: **2 failures in 9 recorded
+full-suite runs**. `rocm-tools/slurm/flake_hunt.sbatch` repeats the whole suite N times and
+dumps every failure block, which is the right next step -- a single green run does not
+clear this.
+
+**Assessment**: real, low-frequency, and *not* explained away. Do not treat a single green
+suite as proof. The most likely remaining candidates, in order: (1) HIP's unpinned D2H
+losing its implicit blocking under multi-process contention; (2) reuse of Warp's per-stream
+`cached_event` (one event per stream, re-recorded on every `wait_stream`/`ScopedStream`
+entry -- legal on CUDA, and a pattern HIP has historically been looser about).
 
 ## Test-gate audit (2026-08-18)
 
@@ -479,12 +519,31 @@ sbatch warp-rocm/rocm-tools/slurm/mjw_probe.sbatch    # full mujoco_warp test su
 sbatch warp-rocm/rocm-tools/slurm/mjw_bench.sbatch    # benchmark suite
 ```
 
+### Validation gate
+
+There is no ROCm CI runner, so validation is a single job rather than a pipeline:
+
+```bash
+sbatch rocm-tools/slurm/validate.sbatch          # build + both suites + flake watch + benchmarks
+VALIDATE_QUICK=1 sbatch .../validate.sbatch      # skip benchmarks
+```
+
+It builds Warp, runs the Warp and mujoco_warp suites, repeats the historically flaky test
+classes five times, smoke-tests the benchmark suite, and ends with a greppable
+`### GATE <name> PASS|FAIL` block plus `OVERALL PASS|FAIL`. `WARP_DIR`/`MJW_DIR` override
+which trees it validates. Run it before declaring a rebase or a port change green; the port
+will otherwise rot silently as mujoco_warp main moves.
+
 `rocm-tools/` also has the diagnostics used in this effort: `graph_overhead.py` (graph replay
 cost vs node count), `graph_census.py` (node-type census of a captured step graph),
 `alloc_trace.py` (which allocations fire during capture, with call sites), `g1_msgraph.py`
 (single- vs multi-stream capture on G1@256; needs `hipgraph_ms.py` fetched from
 zhihuidu-amd/hipgraph-ms), `sort_check.py` (segmented sort correctness), `flex_check.py`
-(cloth physics vs CPU reference).
+(cloth physics vs CPU reference); and from the robustness pass: `big_launch.py`
+(oversized launches past HSA's uint32 ceiling), `null_stream_sync.py` (torn `.numpy()`
+reads), `capture_fork_join.py` (captured cross-stream join ordering), `copy_repro.py`
+(the exact intermittent async-copy configuration), `flake_hunt.py` (repeat one test with
+optional background GPU load).
 
 ## Upstream relationships
 
