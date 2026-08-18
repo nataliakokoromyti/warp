@@ -199,17 +199,17 @@ def get_cuda_device_pair_with_mempool_access_support(devices=None):
 def get_graph_capture_test_devices(mode: str | None = None):
     """Like :func:`get_test_devices`, but drops devices without native graph-capture support.
 
-    Native CUDA-style graph capture is unavailable on HIP/ROCm (``ScopedCapture`` is a
-    no-op there and ``Device.supports_graph_capture`` is ``False``), so tests that build
-    and replay captured graphs must gate on this. Filtering here (rather than relying on
-    the central skip-on-HIP hook) is required for tests whose capture errors are raised
-    inside ``subTest`` blocks, which unittest records as errors before they can propagate.
+    Tests that build and replay captured graphs gate on this rather than on the device
+    backend: HIP/ROCm supports native graph capture, so this getter keeps HIP devices.
+    Filtering here (rather than relying on the central skip hook) is required for tests
+    whose capture errors are raised inside ``subTest`` blocks, which unittest records as
+    errors before they can propagate.
     """
     return [d for d in get_test_devices(mode) if d.supports_graph_capture]
 
 
 def get_cuda_graph_capture_test_devices(mode: str | None = None):
-    """Like :func:`get_cuda_test_devices`, but drops devices without native graph-capture support (HIP)."""
+    """Like :func:`get_cuda_test_devices`, but drops devices without native graph-capture support."""
     return [d for d in get_cuda_test_devices(mode) if d.supports_graph_capture]
 
 
@@ -376,18 +376,23 @@ def assert_np_equal(result: np.ndarray, expect: np.ndarray, tol=0.0):
 
 
 # Substrings identifying runtime errors for features that are fundamentally
-# unsupported on HIP/ROCm (native CUDA graph capture and conditional graph
-# nodes). Tests that incidentally exercise these on a HIP device are skipped
-# rather than hard-failed. See warp._src.context for the raising sites.
+# unsupported on HIP/ROCm. Tests that incidentally exercise these on a HIP
+# device are skipped rather than hard-failed. See warp._src.context for the
+# raising sites.
+#
+# Keep this list minimal and specific: every marker here converts a failure into
+# a silent skip, so an over-broad entry hides real bugs. The generic capture
+# errors that used to appear here ("native graph capture is unsupported",
+# "Graph capture is not active on this stream") were removed once HIP graph
+# capture was enabled -- the first no longer has a raising site, and the second
+# signals a genuine capture state error that must fail loudly.
 #
 # The dynamic-shared-memory shortfall marker covers tiles that fit within
-# NVIDIA's large opt-in shared memory budget but exceed gfx942's 64 KB LDS
+# NVIDIA's large opt-in shared memory budget but exceed CDNA's 64 KB LDS
 # limit (most often the backward pass, which reserves twice the tile bytes).
 # This is a hardware limit rather than a Warp bug, so such launches are skipped
 # on HIP rather than hard-failed.
 _HIP_UNSUPPORTED_ERROR_MARKERS = (
-    "native graph capture is unsupported",
-    "Graph capture is not active on this stream",
     "Conditional graph nodes are not supported on HIP",
     "bytes of dynamic shared memory, but only",
 )

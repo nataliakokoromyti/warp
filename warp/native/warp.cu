@@ -6173,13 +6173,30 @@ size_t wp_cuda_launch_kernel(
     // subsequent launch). Validate the request against the device LDS budget up front so an
     // over-budget launch fails cleanly with CUDA_ERROR_INVALID_VALUE, matching CUDA's synchronous
     // rejection, instead of corrupting the context.
-    // HIP/HSA linearizes the dispatch global work size into a uint32, so a launch whose total
-    // thread count exceeds UINT32_MAX is dispatched and faults with a sticky launch failure that
-    // poisons the context (and cascades to every subsequent launch). The CUDA driver has no such
-    // 32-bit ceiling; reject the over-sized launch up front so it fails cleanly instead.
-    if (dim > 0xFFFFFFFFull) {
-        check_cu(CUDA_ERROR_INVALID_VALUE);
-        return CUDA_ERROR_INVALID_VALUE;
+    // HIP/HSA encodes each dispatch dimension's global work size as a uint32, so
+    // gridDim.x * blockDim.x must stay within UINT32_MAX. An over-sized dispatch is not
+    // rejected by HIP: it faults with a sticky launch failure that poisons the context
+    // (and cascades to every subsequent launch). The CUDA driver has no such 32-bit ceiling.
+    //
+    // A grid-stride kernel loops over the full extent, so the grid size carries no semantics
+    // and shrinking it covers exactly the same work items -- clamp instead of failing. This
+    // is what lets grids beyond 2**32 threads (e.g. mujoco_warp's per-world nv x nv solver
+    // launches at high world counts) run on HIP at all. A lean kernel maps one thread per
+    // work item and is already spread across a 3D grid above, so it cannot exceed the
+    // per-dimension ceiling; reject anything that somehow still does.
+    {
+        const unsigned int max_grid_x_hsa = (unsigned int)(0xFFFFFFFFull / (unsigned long long)block_dim);
+        if (grid_x > max_grid_x_hsa) {
+            if (!grid_stride) {
+                check_cu(CUDA_ERROR_INVALID_VALUE);
+                return CUDA_ERROR_INVALID_VALUE;
+            }
+            grid_x = max_grid_x_hsa;
+            if (cluster_dim > 1)
+                grid_x = (grid_x / (unsigned int)cluster_dim) * (unsigned int)cluster_dim;
+            if (grid_x == 0)
+                grid_x = 1;
+        }
     }
 
     if (dim > 0) {

@@ -288,8 +288,35 @@ poisons the HIP context and aborts the process).
 `aloha_cloth`) overflows on the **L40S too** (22/31/31 worlds vs our 26/29/29) with the
 same assets and settings. The old handoff item claiming AMD uniquely needs `nconmax~26000`
 was wrong -- this is a mujoco_warp/scene-config issue, not a ROCm accounting difference.
-`primitives` runs on the L40S (1.19M steps/s) but still fails on AMD -- that one *is*
-ours to triage.
+
+## `primitives` benchmark -- root-caused and fixed (2026-08-18)
+
+`primitives` was the last AMD-only benchmark failure (it runs on an L40S at 1.19M
+steps/s). It is not a physics or rendering problem: mujoco_warp's Newton solver launches
+
+```python
+wp.launch(_update_gradient_init_h_sparse(sc), dim=(d.nworld, m.nv_pad, m.nv_pad), ...)
+```
+
+and `primitives` runs `nworld=8192` with `nv_pad` in the high hundreds --
+`8192 x 768 x 768 = 4,831,838,208` threads, past `UINT32_MAX`. **HSA encodes each
+dispatch dimension's global work size as a uint32**, so `gridDim.x * blockDim.x` cannot
+exceed `2**32`; `wp_cuda_launch_kernel` rejected the launch up front (the guard exists
+because HIP does *not* reject it -- it dispatches and faults with a sticky launch failure
+that poisons the context). CUDA has no such ceiling, which is the entire vendor
+difference. Verified directly: the same launch shape counts correctly on an L40S
+(`rocm-tools/big_launch.py`).
+
+**Fix** (`warp/native/warp.cu`): the blanket `dim > UINT32_MAX` rejection is only correct
+for *lean* kernels, which map one thread per work item. A **grid-stride** kernel (Warp's
+default) loops over the full extent, so the grid size carries no semantics and clamping
+`grid_x` to `UINT32_MAX / block_dim` covers exactly the same work items. The guard now
+clamps for grid-stride launches and only rejects lean ones. This also un-gates
+`test_large.py`'s two `not d.is_hip` tests, which launch 2**33 and ~5.5e11 threads
+through grid-stride kernels.
+
+Tool: `rocm-tools/big_launch.py` (oversized 3D and 1D launches plus a
+context-still-usable check).
 
 Where the remaining gap actually lives, now that allocation noise is gone:
 
@@ -337,6 +364,46 @@ wide, while reducing blocks resident per CU. Tool: `rocm-tools/blockdim_tune.py`
   (`test_copy_i2c_...Graph...`, `test_implicit_fields`), both exact-value partial-write
   signatures, each passing in other runs (suite is otherwise 8,294-green). Needs a
   dedicated flake-hunt (run those classes ~50×) before trusting or chasing.
+
+## Test-gate audit (2026-08-18)
+
+Every "green" suite result is only as good as what it still runs. The 240 suite skips on
+MI350X break down as follows -- 140 are `add_function_test` device lists that filter HIP
+out entirely (reported as *"No suitable devices to run the test"*), the rest are ordinary
+capability skips shared with CUDA:
+
+| suite | HIP-skipped | verdict |
+|---|---|---|
+| `deterministic/*` (4 modules) | 76 | genuine; the deterministic subsystem is unported (see below) |
+| `test_graph.py` | 20 | **suspect** -- gate reads "HIP/ROCm does not support native CUDA graph capture", inherited from AMD's base where capture was disabled. `rocm-117` enables capture, so this hides 20 tests in exactly the area we changed most, including the `_depends_on`/`_nodes_independent` graph *topology* tests. |
+| `cuda/test_texture.py` | 19 | genuine (CDNA has no texture hardware; the CPU sampling fallback is covered separately) |
+| `cuda/test_cluster_dim.py` | 8 | genuine (no thread block clusters) |
+| `cuda/test_clang_cuda.py` | 7 | genuine (emits PTX/CUDA that cannot load on gfx) |
+| `cuda/test_streams.py` | 3 | 2 genuine HIP limitations (in-graph event timing, external event nodes), 1 timing-flaky (stream priority) |
+| `test_large.py` | 2 | **fixed** -- see the `primitives` section; the grid-stride clamp lets both run |
+| `test_fast_math.py` | 2 | genuine (fast-math `powf(-2,2)` divergence, PTX inspection) |
+| `cuda/test_ipc.py` | 2 | **suspect** -- gated as "not yet validated", not as unsupported |
+| `test_bf16.py` | 1 | needs two devices |
+
+Two other classes of gate were checked and cleared:
+
+- **Dynamic gates** in `test_sparse.py`, `test_array.py`, `geometry/test_hash_grid.py` and
+  `cuda/test_async.py` filter on `Device.supports_graph_capture`, which is now `True` on
+  HIP, so they *do* run there -- only their comments still claimed otherwise. Comments
+  corrected; no coverage was lost. (This is also why the async-copy `_Graph` variants run
+  on HIP at all.)
+- **The central skip-on-HIP hook** (`_HIP_UNSUPPORTED_ERROR_MARKERS` in
+  `unittest_utils.py`) converts a matching *runtime error* into a skip. It carried two
+  over-broad capture markers: `"native graph capture is unsupported"` (no raising site
+  left) and `"Graph capture is not active on this stream"` (a genuine capture-state error
+  that must fail loudly). Both removed; measured effect on the suite is zero (only the
+  conditional-graph-node marker ever fired).
+
+FP-tolerance relaxations were reviewed and are all narrow and justified: gfx `powf`
+differs from NVIDIA's by ~1e-6 (`test_map.py` rtol 5e-6, `test_codegen.py` 4 places),
+backward accumulation by ~1e-6 (`test_grad.py` tol 1e-4 on values of magnitude 10-40).
+The `test_atomic_cas.py` spinlock exclusion is a correct hardware fact -- CDNA wavefronts
+share an execution mask, so a GPU-wide spinlock built on `atomic_cas` deadlocks.
 
 ## Known issues on HIP (gated in tests, documented here)
 
