@@ -466,11 +466,35 @@ is precisely "the buffer reads back partly zero" (every async-copy test allocate
 destination from `np.zeros`, so a stale in-flight zero-fill landing on recycled memory
 produces the observed zero prefix).
 
-Where to look: `warp.cu` orders in-capture frees after their allocation with the
-allocating stream's **`cached_event`** (`cuEventRecord(alloc_si->cached_event, alloc_stream)`
-then `cuStreamWaitEvent(free_stream, ...)`, three sites around lines 647 / 1070 / 1229).
-That is one reused event per stream; the pattern is safe under CUDA's event semantics and
-is the first thing to check against HIP's.
+**Read of the root cause** (`warp/native/warp.cu`, `wp_free_device_async`, the graph-alloc
+branch). The two backends order an in-capture free very differently:
+
+- **CUDA**: `cudaGraphAddMemFreeNode(&free_node, graph, alloc_leaf_nodes, ...)` where
+  `alloc_leaf_nodes` is *every leaf node descended from the alloc node*. The free is
+  therefore ordered after **all** uses of the allocation, on **any** stream in the capture.
+- **HIP**: `hipGraphAddMemFreeNode` rejects pointers that came from `hipMallocAsync` during
+  stream capture, so the port substitutes `hipFreeAsync(ptr, capture->stream)` and lets
+  capture record it. That orders the free after the **capture stream's frontier only**.
+
+An allocation used on a *side* stream inside the capture therefore has no edge from its
+kernels to the free node -- and `wp.ScopedStream` defaults to `sync_exit=False`, so leaving
+the side-stream block does not join it back either. At replay the memory can be unmapped
+while those kernels are still reading it, which is the fault. This is a gap in **our HIP
+branch**, not (necessarily) a ROCm bug.
+
+Proposed fix: before issuing the free on the capture stream, join every stream that is part
+of the same capture into it (`cuStreamGetCaptureInfo` to match the capture id, then
+record/wait per stream), reproducing at stream granularity the dependency CUDA gets from
+`alloc_leaf_nodes`. Caveat to check while implementing: if the side stream was already
+destroyed by the time the free runs, it is gone from `g_streams` and the join cannot be
+made -- that case needs the dependency captured at allocation time instead.
+`rocm-tools/graph_alloc_fault.py` decomposes the test (temp stream vs device stream, with
+and without fills, large vs small) so the fix can be validated against the exact ingredient.
+
+Related, and worth checking in the same pass: the deferred/eager free paths order the free
+against the allocating stream using that stream's single reusable `cached_event`
+(lines ~647 and ~1070). If the allocating stream has been destroyed, `get_stream_info`
+returns NULL and the dependency is silently skipped.
 
 L40S control, same file un-gated, stock Warp 1.16, one process per test: **27 PASS / 0 FAIL
 / 0 CRASH / 4 SKIP**, including all 16 alloc/free graph-topology tests and the transient-

@@ -106,10 +106,21 @@ the process.
 
 ---
 
-## 4. Under investigation: an in-capture free on a temporary stream faults the GPU
+## 4. API gap: `hipGraphAddMemFreeNode` cannot take a captured `hipMallocAsync` pointer
 
-*Reported here for visibility; we have not yet established whether the bug is in ROCm or in
-our own HIP capture path, so treat it as a question rather than a filing.*
+*Most likely a gap in our own HIP path rather than a ROCm defect -- included because the
+workaround it forces is where the defect lives, and because a HIP equivalent of the CUDA
+API would remove the need for a workaround at all.*
+
+`cudaGraphAddMemFreeNode(&node, graph, deps, ndeps, ptr)` lets a runtime state exactly which
+nodes a free must follow. Warp uses it to make an in-capture free depend on *every leaf node
+descended from the allocation*, so the free is ordered after all uses of the allocation on
+every stream in the capture. `hipGraphAddMemFreeNode` rejects a pointer obtained from
+`hipMallocAsync` during stream capture (`hipErrorInvalidValue`) and only accepts pointers
+from `hipGraphAddMemAllocNode` on an explicitly constructed graph, so the only available
+substitute is `hipFreeAsync` on the capturing stream -- which can only express "after this
+one stream's frontier". Any allocation used on a side stream inside the capture then has no
+edge to its free node. Symptom below.
 
 Warp's `test_cuda_graph_alloc_transient_stream` builds this graph on MI350X / ROCm 7.2:
 
@@ -131,16 +142,17 @@ Reason: Unknown.
 The same test passes on CUDA — it exists specifically to catch a free that is ordered on the
 wrong stream and therefore releases memory another stream is still reading. Running the
 whole file one-process-per-test on an L40S with stock Warp 1.16 gives 27 pass / 0 fail /
-0 crash, so every test in it is expected to hold. What we would
-like to know from AMD: are stream-ordered mempool free nodes captured into a hipGraph
-required to carry a dependency on the allocating stream's pending work, and if so is that
-dependency honored when the allocating stream is destroyed before the graph is launched?
+0 crash, so every test in it is expected to hold.
 
-We order the free after the allocation with an event recorded on the allocating stream
-(`hipEventRecord` on the alloc stream, `hipStreamWaitEvent` on the free stream) — the same
-construction CUDA is happy with. Repro: remove the `not d.is_hip` filter at the top of
-`warp/tests/test_graph.py` and run
-`python warp/tests/test_graph.py TestGraph.test_cuda_graph_alloc_transient_stream_cuda_0`.
+What we would like from AMD: either `hipGraphAddMemFreeNode` accepting captured
+`hipMallocAsync` pointers, so a runtime can name the free's dependencies the way
+`cudaGraphAddMemFreeNode` allows, or a documented statement of exactly what ordering
+`hipFreeAsync` on a capturing stream is guaranteed to record.
+
+Repro: remove the `not d.is_hip` filter at the top of `warp/tests/test_graph.py` and run
+`python warp/tests/test_graph.py TestGraph.test_cuda_graph_alloc_transient_stream_cuda_0`;
+`rocm-tools/graph_alloc_fault.py` isolates the ingredients (temporary vs device stream,
+with and without capture-time fills, large vs small buffers).
 
 ---
 
