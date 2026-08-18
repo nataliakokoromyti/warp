@@ -21,6 +21,7 @@ Self-contained (no warp.tests imports) so it runs against stock Warp too.
 """
 
 import argparse
+import contextlib
 import sys
 
 import numpy as np
@@ -106,16 +107,32 @@ class Capturable:
                     wp.capture_launch(graph, stream=self.stream)
 
 
-def one_copy(device, src_ctor, dst_ctor, value_offset, use_own_stream, use_graph):
+def _mempool_scope(device, mode):
+    """The mempool context the test template establishes, or a chosen subset.
+
+    ``template`` mirrors copy_template exactly: for a same-device copy its two
+    ScopedMempool blocks collapse to "mempool disabled inside the body", and it
+    also enables mempool access from the device to itself.
+    """
+    stack = contextlib.ExitStack()
+    if mode == "template":
+        stack.enter_context(wp.ScopedMempool(device, True))
+        stack.enter_context(wp.ScopedMempool(device, False))
+        stack.enter_context(wp.ScopedMempoolAccess(device, device, True))
+    elif mode == "on":
+        stack.enter_context(wp.ScopedMempool(device, True))
+    elif mode == "off":
+        stack.enter_context(wp.ScopedMempool(device, False))
+    # mode == "none": no scoping at all
+    return stack
+
+
+def one_copy(device, src_ctor, dst_ctor, value_offset, use_own_stream, use_graph, mempool="template"):
     """Run one copy the way copy_template does for the d2d case."""
     src_data = np.arange(value_offset, value_offset + N, dtype=np.float32)
     dst_data = np.zeros(N, dtype=np.float32)
 
-    with (
-        wp.ScopedMempool(device, True),
-        wp.ScopedMempool(device, False),
-        wp.ScopedMempoolAccess(device, device, True),
-    ):
+    with _mempool_scope(device, mempool):
         src = src_ctor(src_data, device=device)
         dst = dst_ctor(dst_data, device=device)
 
@@ -159,12 +176,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--variants", choices=["target", "all"], default="target")
+    parser.add_argument(
+        "--mempool",
+        choices=["template", "on", "off", "none"],
+        default="template",
+        help="which memory-pool scoping to apply around each copy; 'template' mirrors the "
+        "test exactly, the others bisect whether that scoping is what triggers the corruption",
+    )
     args = parser.parse_args()
 
     wp.init()
     device = wp.get_device("cuda:0")
     print(
-        f"device: {device} arch={device.arch} graph_capture={getattr(device, 'supports_graph_capture', None)}",
+        f"device: {device} arch={device.arch} mempool_scope={args.mempool} "
+        f"graph_capture={getattr(device, 'supports_graph_capture', None)}",
         flush=True,
     )
 
@@ -190,7 +215,7 @@ def main():
         details = []
         for _i in range(args.iters):
             offset += N
-            res = one_copy(device, CTORS[src_type], CTORS[dst_type], offset, own_stream, use_graph)
+            res = one_copy(device, CTORS[src_type], CTORS[dst_type], offset, own_stream, use_graph, args.mempool)
             if res is not None:
                 bad += 1
                 if len(details) < 5:
