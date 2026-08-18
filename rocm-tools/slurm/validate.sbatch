@@ -51,8 +51,12 @@ else
   record build FAIL
 fi
 
+# The suite runner clears its kernel cache on exit; on NFS that rmtree can raise
+# "Device or resource busy: .nfs..." *after* the result line, so always grep the
+# whole log for the verdict rather than its tail.
 echo "############ 2/5 warp suite ############"
-python -m warp.tests -s autodetect 2>&1 | tail -25 | tee "$TMPDIR/warp-suite.txt"
+python -m warp.tests -s autodetect > "$TMPDIR/warp-suite.txt" 2>&1
+tail -20 "$TMPDIR/warp-suite.txt"
 if grep -qE "^OK( \(|$)" "$TMPDIR/warp-suite.txt"; then record warp_suite PASS; else record warp_suite FAIL; fi
 
 echo "############ 3/5 flake watch (historically intermittent classes) ############"
@@ -60,8 +64,9 @@ echo "############ 3/5 flake watch (historically intermittent classes) #########
 # under repetition; a single green run does not clear them.
 FLAKE_FAILS=0
 for i in 1 2 3 4 5; do
-  python -m warp.tests -s autodetect -k TestAsync -k TestFemField 2>&1 | tail -4 | tee "$TMPDIR/flake-$i.txt"
-  grep -qE "^OK( \(|$)" "$TMPDIR/flake-$i.txt" || FLAKE_FAILS=$((FLAKE_FAILS + 1))
+  python -m warp.tests -s autodetect -k TestAsync -k TestFemField > "$TMPDIR/flake-$i.txt" 2>&1
+  tail -3 "$TMPDIR/flake-$i.txt"
+  grep -qE "^OK( \(|$)" "$TMPDIR/flake-$i.txt" || { FLAKE_FAILS=$((FLAKE_FAILS + 1)); grep -nE "^(FAIL|ERROR):" "$TMPDIR/flake-$i.txt"; }
 done
 if [ "$FLAKE_FAILS" -eq 0 ]; then record flake_watch PASS; else record flake_watch "FAIL($FLAKE_FAILS/5)"; fi
 
