@@ -129,6 +129,24 @@ Lower priority, but each cost us debugging time and forced a workaround:
   (`HSA_STATUS_ERROR_EXCEPTION ... code: 0x1016`) before buffered device printf output is
   flushed, so users see a raw hardware exception instead of Warp's diagnostic naming the
   offending array and index.
+- **An over-sized dispatch is accepted and then faults stickily.** HSA encodes each
+  dimension's global work size as a uint32, so `gridDim.x * blockDim.x` must stay within
+  `UINT32_MAX`. `hipModuleLaunchKernel` does not reject a larger request the way the CUDA
+  driver does — it dispatches, the kernel faults asynchronously, and the launch failure is
+  sticky, poisoning the context for every subsequent launch. The same applies to
+  over-budget shared memory and to a `block_dim` above the function's
+  `maxThreadsPerBlock`. We validate all three in our launcher because a clean synchronous
+  rejection is not available. Real impact: mujoco_warp's `primitives` benchmark
+  (`nworld=8192`, `nv_pad≈768` → 4.83e9 threads in one solver launch) ran on an L40S and
+  could not run on MI350X until we taught the launcher to shrink the grid for grid-stride
+  kernels. Repro: `rocm-tools/big_launch.py`.
+- **Cross-process IPC memory does not round-trip.** `hipIpcOpenMemHandle` returns
+  `hipErrorInvalidValue` for a handle exported by another process, and
+  `hipIpcGetEventHandle` returns `hipErrorInvalidConfiguration` where CUDA succeeds and
+  produces a handle whose invalidity is only detected on import. Warp's two IPC tests pass
+  on CUDA and fail on MI350X (one with a wrong value — 84.0 where 168.0 was expected, i.e.
+  the peer process's write to the shared buffer was not visible). Gated off on HIP;
+  we have not investigated whether this is a configuration or a runtime limitation.
 
 ---
 

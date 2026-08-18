@@ -100,9 +100,16 @@ class TestIpc(unittest.TestCase):
 
 add_function_test(TestIpc, "test_ipc_get_memory_handle", test_ipc_get_memory_handle, devices=cuda_devices)
 add_function_test(TestIpc, "test_ipc_get_event_handle", test_ipc_get_event_handle, devices=cuda_devices)
-# HIP: hipIpcGetEventHandle does not enforce the interprocess-flag requirement
-# the way CUDA does, and cross-process IPC event/memory semantics are not yet
-# validated on ROCm; restrict these two to real CUDA devices.
+# HIP: cross-process IPC does not round-trip on ROCm 7.2 / MI350X. Measured with
+# the gate removed:
+#   * test_ipc_event_missing_interprocess_flag -- hipIpcGetEventHandle returns
+#     hipErrorInvalidConfiguration instead of producing a handle whose invalidity
+#     is detected on import, so Warp's "IPC event handle appears to be invalid"
+#     warning is never reached.
+#   * test_ipc_multiprocess_write -- hipIpcOpenMemHandle fails with
+#     hipErrorInvalidValue and the peer process's write to the shared buffer is
+#     not visible (reads 84.0 where 168.0 is expected).
+# Restrict both to real CUDA devices until ROCm IPC is understood.
 non_hip_devices = [d for d in cuda_devices if not d.is_hip]
 add_function_test(
     TestIpc,

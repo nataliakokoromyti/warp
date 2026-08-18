@@ -422,8 +422,15 @@ capability skips shared with CUDA:
 | `cuda/test_streams.py` | 3 | 2 genuine HIP limitations (in-graph event timing, external event nodes), 1 timing-flaky (stream priority) |
 | `test_large.py` | 2 | **fixed** -- see the `primitives` section; the grid-stride clamp lets both run |
 | `test_fast_math.py` | 2 | genuine (fast-math `powf(-2,2)` divergence, PTX inspection) |
-| `cuda/test_ipc.py` | 2 | **suspect** -- gated as "not yet validated", not as unsupported |
+| `cuda/test_ipc.py` | 2 | gate is correct, reason was not -- see below |
 | `test_bf16.py` | 1 | needs two devices |
+
+The two IPC tests were re-run with the gate removed: both genuinely fail on MI350X.
+`hipIpcOpenMemHandle` returns `hipErrorInvalidValue` for a handle exported by another
+process and the peer's write is not visible (84.0 read where 168.0 was expected);
+`hipIpcGetEventHandle` returns `hipErrorInvalidConfiguration` where CUDA succeeds. So the
+gate stays, but it was hiding a *known-broken* feature behind an "unvalidated" comment --
+now stated as a measured failure in the test file and in `AMD_ROCM_ISSUES.md`.
 
 Two other classes of gate were checked and cleared:
 
