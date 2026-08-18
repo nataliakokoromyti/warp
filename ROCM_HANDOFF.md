@@ -340,10 +340,37 @@ wide, while reducing blocks resident per CU. Tool: `rocm-tools/blockdim_tune.py`
 
 ## Known issues on HIP (gated in tests, documented here)
 
-- **Deterministic mode is not ported**: warp 1.17's deterministic subsystem (phase-0
-  counting, deterministic scatter/counter compaction) does not hold on ROCm — repeated
-  runs reorder atomically-assigned slots. Whole `warp/tests/deterministic/` suite gated
-  off HIP. Needs its own porting effort.
+- ~~Deterministic mode is not ported~~ — **fixed 2026-08-18**. Root cause was a
+  preprocessor gap, not a wave64 issue: `warp/native/deterministic.h` guarded every
+  device-side helper and every `WP_DET_*` macro on `__CUDA_ARCH__` alone, which HIPRTC
+  never defines, so generated kernels always took the CPU fallback branch. The
+  consumed-return counter fell back to a plain `wp::atomic_add` (scheduling-order slot)
+  and the phase guards vanished, so phase 0 *and* phase 1 both mutated user state —
+  `test_conditional_counter` returned exactly 2× the expected count and a fresh
+  permutation each run. Fix: add `__HIP_DEVICE_COMPILE__` to the guards and give
+  `is_global_store_target()` an AMDGCN implementation (`__builtin_amdgcn_is_shared` /
+  `_is_private`; HIPRTC has no `__isGlobal()` and cannot assemble the PTX
+  `isspacep.global` path). The two-pass scheme itself is warp-width agnostic — slots come
+  from a sort over `(dest, record_ordinal)` keys, not atomic arrival order. Deterministic
+  suite on MI350X: 51 failures + 7 errors → **0 failures, 92/99 passing**, including the
+  bfloat16 and GPU_TO_GPU binned-reduction paths.
+- **Deterministic launches cannot be graph-captured on HIP** (7 tests still gated):
+  the launcher allocates temporary key/value/prefix buffers per launch, and ROCm 7.2
+  permits no device allocation while a capture is active. `hipMallocAsync` on the
+  dedicated non-capturing allocation stream fails with error 900 even under the relaxed
+  thread capture mode, and non-pooled `hipMalloc` invalidates the capture outright (Warp
+  already refuses it up front — `hip_alloc_forbidden_during_capture()` in `warp.cu`).
+  The fix is to cache the temporary buffers across launches so a warm capture allocates
+  nothing — the same lever as the mujoco_warp per-step scratch cache.
+- **Newly surfaced**: `test_module_option_override_cuda_0` (GPU_TO_GPU scatter) fails in
+  the full suite but passes when the deterministic suite runs alone — reproducible 3/3
+  each way. The scatter silently drops all records (result 0.0), the signature of
+  `helper.count == nullptr` at launch; previously masked by the CPU fallback. Ruled out:
+  kernel-cache state (the suite passes on both a cold and a warm cache) and codegen (the
+  module compiles to an identical hash either way), so it is launch-side global state
+  leaking in from another test module. Pure Python launch path, so likely reproduces on
+  CUDA too — check there before assuming it is a HIP issue. Bisecting which preceding
+  suite triggers it is the obvious next step.
 - **Event nodes inside graphs are unreliable**: in-graph event timing reads
   invalid handles, and external-event record/wait nodes do not synchronize
   separately-launched graphs (`test_event_external` gated).
