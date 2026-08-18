@@ -455,14 +455,47 @@ CONCURRENT_K=8   processes_reporting_mismatch = 5/8
 So there is now a **standalone reproducer that does not need the test suite**: eight
 concurrent processes doing the failing copy, ~1 in 1,500-10,000 iterations per process.
 
-The signature is startlingly *deterministic* -- every single occurrence, across six hits in
-one process and across different processes, reports the identical `first_mismatch = 256`
-and `total_mismatch = 125,184`. A timing race would scatter those numbers. This looks like
-a structural corruption whose *trigger* is contention rather than a race whose *extent* is
-random, which is a much more tractable bug. `rocm-tools/copy_repro.py` now reports which
-side is wrong (both arrays are compared against the values actually uploaded), the run and
-stride structure of the damage, and whether a full device synchronize repairs it -- the
-last of which separates a lost transfer from a corrupt device buffer.
+### What the corruption actually is: **one thread block in every eight writes nothing**
+
+With the reproducer in hand, `copy_repro.py` was extended to report the *structure* of the
+damage. Every occurrence, in every process, has the same shape:
+
+```
+{'dst_bad': 125184, 'src_bad': 0,
+ 'dst_structure': {'n': 125184, 'runs': 489, 'run_lengths': [256],
+                   'first_runs': [(256,256),(2304,256),(4352,256),(6400,256)],
+                   'strides': [2048], 'all_zero': True, 'values_seen': [0.0]},
+ 'dst_ok_after_sync': False, 'src_ok_after_sync': True}
+```
+
+Read that carefully:
+
+* **489 runs of exactly 256 elements**, at a **stride of exactly 2048 elements**, always
+  zero. Warp launches with 256 threads per block, so 256 elements is *one thread block's
+  output* and 2048 elements is *eight blocks*.
+* So **exactly one thread block in every eight produced no output at all**. That accounts
+  for every count observed anywhere: 489x256 = 125,184; 488x256 = 124,928;
+  488x256+64 = 124,992 (partial final block). The 12.5% is 1/8, exactly.
+* Only the *phase* varies between occurrences (first bad block at 0, 256, 512, 1792,
+  12288 ...), which is why the totals cluster on two or three values.
+* `dst_ok_after_sync: False` -- a full device synchronize and re-read does **not** repair
+  it. The writes never landed; this is not a transfer or readback problem at all.
+* It lands on whichever array a kernel most recently wrote (`dst_bad` in some hits,
+  `src_bad` in others), and it happens with and without graph capture, on the device stream
+  and on a user stream.
+
+**MI350X is an 8-XCD part** (CDNA4: 8 accelerator complex dies, 32 CUs each) and in SPX
+mode workgroups are distributed round-robin across the XCDs. "Every 8th workgroup produced
+nothing" is "one XCD's share of the launch produced nothing".
+
+If that reading is right, the implication is much larger than a flaky test: **under
+multi-process contention, a kernel launch on MI350X can silently lose 1/8 of its
+workgroups**, which would corrupt any computation, not just copies.
+`rocm-tools/block_dropout.py` tests exactly that with a trivial `a[tid] = 1.0` kernel and
+reports the missing block indices and their residue mod 8 -- if a plain write kernel loses
+blocks the same way, this is a runtime/hardware scheduling bug and belongs with AMD
+immediately. Also worth capturing when reproducing: `rocm-smi --showcomputepartition`
+(SPX/DPX/CPX mode) and the number of concurrent processes on the device.
 
 **Assessment**: real, reproduces at roughly **50% per full-suite run**, and it **silently
 corrupts data Warp hands back to the user**. This is now the most serious open item in the
