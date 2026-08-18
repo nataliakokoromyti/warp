@@ -35,8 +35,8 @@ repaired by sync     : no
 
 Every corrupted-element count we have ever seen falls out of that: 489x256 = 125,184;
 488x256 = 124,928; 488x256+64 = 124,992 (partial final block). Only the phase varies
-between occurrences (first bad block at 0, 256, 512, 1792, 12288, ...). In bytes the
-pattern is **1 KB lost out of every 8 KB**.
+between occurrences -- the missing blocks always share a single residue mod 8, and which
+residue varies (we have seen 1, 2, 4, 5 and 7).
 
 **Bisected to the allocator.** Running the same workload in 8 concurrent processes with
 only the allocation path changed:
@@ -48,9 +48,9 @@ only the allocation path changed:
 
 Controls that are clean, all at 8-way concurrency: a trivial `a[tid] = 1.0` kernel into a
 pool-allocated buffer (0 in 29,000 launches), and the same with a multi-MB pageable H2D
-initialization first (0 in 37,000). So it is neither a workgroup-scheduling problem nor an
-H2D ordering problem, and the 8-XCD workgroup distribution (this machine runs SPX / NPS1)
-is not the explanation either -- **it only happens to memory that came from `hipMalloc`.**
+initialization first (0 in 37,000). So it is not a host-to-device ordering problem --
+**it only happens to memory that came from `hipMalloc`.** (This machine runs Compute
+Partition SPX, Memory Partition NPS1.)
 
 **Minimal reproduction** -- no copies, no graphs, no streams, no host transfers:
 
