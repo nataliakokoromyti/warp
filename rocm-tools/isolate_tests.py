@@ -52,7 +52,7 @@ def main():
     for name in names:
         cmd = [sys.executable, args.module, name]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, check=False)
             out = proc.stdout + proc.stderr
             if proc.returncode == 0:
                 verdict = "SKIP" if "skipped" in out and "Ran 1 test" in out and " ok" not in out else "PASS"
