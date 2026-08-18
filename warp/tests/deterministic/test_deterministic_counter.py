@@ -1041,12 +1041,7 @@ for _name in (
 
 _add("test_counter_correctness", devices=all_devices)
 _add("test_int_atomic_passthrough", devices=all_devices)
-
-# HIP known issue: counter-based stream compaction under a conditional is not
-# yet deterministic on ROCm -- repeated runs reorder the compacted elements.
-# The deterministic-mode transform needs a HIP-specific port; until then this
-# test only runs on real CUDA devices.
-_add("test_conditional_counter", devices=[d for d in cuda_devices if not d.is_hip])
+_add("test_conditional_counter", devices=cuda_devices)
 
 
 if __name__ == "__main__":
