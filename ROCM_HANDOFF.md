@@ -578,6 +578,15 @@ a question for the solver bucket (this scene budgets 100 solver iterations with 
 cone and converges in ~3), and it is worth re-running the `opt.iterations` control on it now
 that collision no longer swamps everything else.
 
+**Next lead, unexplored:** mujoco_warp has **28 device prints** in total, and the file with
+the most is `collision_flex.py` (**9**) -- the cloth family, which is separately known to be
+among the worst-performing scenes on this branch. `smooth.py` (2), `forward.py` (4) and
+`collision_convex.py` (3) are also worth an A/B. Anyone picking this up: apply
+`rocm-tools/sdf_debugprint_patch.py`'s guard pattern to the file, then time with
+`rocm-tools/collision_bench.py` and read `vgpr_spill_count` with
+`rocm-tools/hsaco_regs.py` -- a spill count in the hundreds under
+`max_flat_workgroup_size: 1024` is the signature.
+
 Also refuted this round: `rocprofv3 --kernel-trace` is unusable on a captured mujoco_warp
 run -- it hangs on `aloha_sdf` and segfaults with `--output-format csv` (matching the known
 `--stats` hang). Use `collision_bench.py` / the event trace instead.
