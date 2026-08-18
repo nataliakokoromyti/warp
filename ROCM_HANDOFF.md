@@ -610,6 +610,11 @@ IPC. Original working notes below.
   with no C++ headers. The job templates in `rocm-tools/slurm/` handle it
   (`HIPCC_COMPILE_FLAGS_APPEND=--gcc-install-dir=.../13`). An admin install of
   `libstdc++-14-dev` would obsolete this.
+- **Budget 45-60 min for a native build**, not the ~5 min the NVIDIA docs suggest.
+  `warp/native/reduce.cu` alone takes 30+ minutes under `clang -O3 --offload-arch=gfx950`
+  (single-threaded, and the node is usually running other people's jobs). Never rebuild in
+  the shared `/matx/u/$USER/warp-rocm` tree while others are running against it — clone
+  first (`rocm-tools/slurm/robust_build.sbatch` does).
 
 ## Quickstart
 
