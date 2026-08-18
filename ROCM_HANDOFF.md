@@ -505,8 +505,18 @@ share an execution mask, so a GPU-wide spinlock built on `atomic_cas` deadlocks.
   separately-launched graphs (`test_event_external` gated).
 - **Conditional graph nodes unsupported** (`is_conditional_graph_supported()` False);
   captured solver loops run fixed iteration counts.
+- **In-capture free on a temporary side stream faults the GPU** (found 2026-08-18):
+  `test_cuda_graph_alloc_transient_stream` aborts with "Memory access fault by GPU node-2".
+  The whole `test_graph.py` suite stays gated because the fault kills the test process.
+  **This is the highest-priority open correctness item** -- see the gate-audit section.
+- **Cross-process IPC does not work**: `hipIpcOpenMemHandle` rejects a peer handle and the
+  peer's write is not visible; `hipIpcGetEventHandle` returns an error where CUDA succeeds.
+  Both `test_ipc` cross-process tests gated.
 - **Device-side abort loses printf output**: gfx950 HSA queue aborts (intentional traps,
   OOB asserts) fire before device printf flushes; tests accept the HSA error signature.
+- **A single launch cannot exceed `UINT32_MAX` threads per dispatch dimension** (HSA
+  encoding). Grid-stride kernels now clamp the grid and run correctly; lean kernels are
+  rejected cleanly. See the `primitives` section.
 - ~~Cloth benchmarks need `nconmax≈26000` vs the NVIDIA-tuned 2,200~~ — **retired
   2026-08-17**: the same overflow reproduces on an NVIDIA L40S with identical assets and
   settings, so it is not an AMD accounting difference. Upstream/scene issue.
