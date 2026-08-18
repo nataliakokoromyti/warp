@@ -555,6 +555,29 @@ solve, not a semantic change.
 Test suites, both green: **Warp 8,294 tests, `OK (skipped=240)`** with the codegen change on
 (`rocm-tools/slurm/col_validate_warp.sbatch`) -- identical to the branch baseline.
 
+**Both mujoco_warp fixes are upstream candidates, not ROCm workarounds.** The same patched
+source on an L40S (`rocm-tools/slurm/col_sdf_nv_ab.sbatch`) is slightly *faster*, never
+slower:
+
+| L40S | stock a | patched | stock b |
+|---|---|---|---|
+| isolated `_sdf_narrowphase`, ms | 16.452 | **16.048** | 16.490 |
+| `aloha_sdf` @8192, steps/s | 398,803 | **405,298** | 398,240 |
+
++2.5% on the kernel and +1.6% end to end on CUDA. Which closes the loop on the whole
+investigation:
+
+| `_sdf_narrowphase`, isolated | MI350X | L40S | ratio |
+|---|---|---|---|
+| stock | 235.5 - 263.5 | 16.45 | **14.3 - 16.0x** |
+| patched | **18.74** | 16.05 | **1.17x** |
+
+`aloha_sdf` end to end goes from **8.48x behind the L40S to 3.92x**, and the residue is no
+longer collision -- the collision kernel is at parity. Where the remaining 3.9x lives is now
+a question for the solver bucket (this scene budgets 100 solver iterations with an elliptic
+cone and converges in ~3), and it is worth re-running the `opt.iterations` control on it now
+that collision no longer swamps everything else.
+
 Also refuted this round: `rocprofv3 --kernel-trace` is unusable on a captured mujoco_warp
 run -- it hangs on `aloha_sdf` and segfaults with `--output-format csv` (matching the known
 `--stats` hang). Use `collision_bench.py` / the event trace instead.
