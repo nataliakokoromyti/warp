@@ -471,6 +471,30 @@ and that is worse than paying for 93 cheap spills. So the launch-bounds default 
 guardrail against the cliff, not a free win everywhere -- worth keeping in mind if a future
 Warp kernel regresses on ROCm.
 
+**Third, smaller lever: the octree descent indexes a register vector dynamically.**
+`find_oct` picks the next child with `oct_child[node][4*z + 2*y + x]`. AMD GPUs have no
+indexed register-file access, so an 8-wide value indexed by a runtime value either goes to
+scratch or becomes a select chain -- inside a 100-iteration pointer-chasing loop that is the
+hottest code in the kernel. Writing the select chain out by hand
+(`rocm-tools/sdf_oct_patch.py`, which also hoists the eight repeated `oct_child[node]` loads
+in the leaf test into one) is worth little while `printf` dominates and becomes visible once
+it does not (`rocm-tools/slurm/col_sdf_round3.sbatch`):
+
+| body | no `__launch_bounds__` | `__launch_bounds__(256)` |
+|---|---|---|
+| stock (drift control x2) | 263.05 / 264.39 | 153.51 / 152.79 |
+| + static octree index | 259.95 (1.2%) | 144.26 (6.0%) |
+| + static octree index, prints removed | **18.84 (14% over prints-removed alone)** | 37.30 |
+
+Stacked, `_sdf_narrowphase` goes **263.0 ms -> 18.84 ms, 14.0x**, against the L40S's 16.53 ms
+for the same isolated kernel: **1.14x, effectively parity**. Repeat controls in this job
+agree to 0.5%, and the three jobs that measured the stock configuration independently landed
+on 263.50 / 262.47 / 263.05 / 264.39.
+
+So the ranked fix list for the one genuinely AMD-hostile collision kernel is: compile out the
+device prints (12.0x), then the static octree index (a further 1.16x), and `__launch_bounds__`
+only matters if the prints stay.
+
 Also refuted this round: `rocprofv3 --kernel-trace` is unusable on a captured mujoco_warp
 run -- it hangs on `aloha_sdf` and segfaults with `--output-format csv` (matching the known
 `--stats` hang). Use `collision_bench.py` / the event trace instead.
