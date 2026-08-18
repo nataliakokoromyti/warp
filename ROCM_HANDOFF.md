@@ -416,13 +416,18 @@ under CUDA's event semantics, worth verifying against HIP's.
 
 Every "green" suite result is only as good as what it still runs. The 240 suite skips on
 MI350X break down as follows -- 140 are `add_function_test` device lists that filter HIP
-out entirely (reported as *"No suitable devices to run the test"*), the rest are ordinary
-capability skips shared with CUDA:
+out entirely, the rest are ordinary capability skips shared with CUDA.
+
+**Counting caveat**: a device filter only produces a visible *"No suitable devices to run
+the test"* skip when it empties the list. A test registered for `[cpu, cuda:0]` that
+becomes `[cpu]` on HIP still runs -- on the CPU -- and reports nothing, so its GPU coverage
+disappears silently. `test_graph.py` loses ~11 more tests that way on top of the 20 counted
+below. Read the numbers as a lower bound.
 
 | suite | HIP-skipped | verdict |
 |---|---|---|
 | `deterministic/*` (4 modules) | 76 | genuine; the deterministic subsystem is unported (see below) |
-| `test_graph.py` | 20 | **hides a hard GPU crash -- see below** |
+| `test_graph.py` | 20 (plus ~11 silent) | **hides a hard GPU crash -- see below** |
 | `cuda/test_texture.py` | 19 | genuine (CDNA has no texture hardware; the CPU sampling fallback is covered separately) |
 | `cuda/test_cluster_dim.py` | 8 | genuine (no thread block clusters) |
 | `cuda/test_clang_cuda.py` | 7 | genuine (emits PTX/CUDA that cannot load on gfx) |
