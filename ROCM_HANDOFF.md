@@ -208,6 +208,24 @@ node support with AMD**, and it also bounds any home-grown workaround (a host-si
 chunked-solver stepper: launch K iterations, read `nsolving`, repeat — costs 1-2 syncs per
 step, which is <1% of a 6.5 ms step).
 
+### Our mujoco_warp patch is safe on NVIDIA (2026-08-17)
+
+Evidence for upstreaming the vendor-neutral parts (per-step scratch cache, EPA scratch
+hoist, warm capture in `cli.unroll`). Full mujoco_warp suite on an L40S, pristine upstream
+vs the same tree with our compat patch applied:
+
+| | result |
+|---|---|
+| pristine upstream | 1241 passed, 22 skipped |
+| **with our patch** | **1241 passed, 22 skipped** |
+| **tests failing only with our patch** | **none** |
+
+So the patch is a no-op for CUDA correctness while removing 34 alloc nodes from the L40S
+warm-captured graph. (The wall-clock difference between the two runs in that job -- 16:44
+vs 5:53 -- is **not** a patch speedup: they shared a per-job Warp kernel cache and the
+pristine run went first, paying all the JIT compilation. A reversed-order control is
+running to isolate the real effect; do not quote the raw timings.)
+
 ### Prototype: recovering the conditional-node win without AMD (2026-08-17)
 
 `rocm-tools/chunked_stepper.py` emulates conditional-graph early exit with host-side
