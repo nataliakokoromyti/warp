@@ -26,6 +26,7 @@ concurrently against one GPU::
 """
 
 import argparse
+import contextlib
 import time
 
 import numpy as np
@@ -67,6 +68,13 @@ def main():
     parser.add_argument("--n", type=int, default=1000000)
     parser.add_argument("--max-reports", type=int, default=5)
     parser.add_argument(
+        "--no-mempool",
+        action="store_true",
+        help="allocate with the default allocator (hipMalloc) instead of the memory pool "
+        "(hipMallocAsync). Bisection showed this is the trigger: the corruption appears only "
+        "when the pool is disabled.",
+    )
+    parser.add_argument(
         "--h2d-init",
         action="store_true",
         help="initialize the buffer with a host-to-device copy of a numpy array instead of a "
@@ -79,32 +87,34 @@ def main():
     device = wp.get_device("cuda:0")
     print(
         f"device: {device} n={args.n} blocks={(args.n + BLOCK - 1) // BLOCK} "
-        f"iters={args.iters} h2d_init={args.h2d_init}",
+        f"iters={args.iters} h2d_init={args.h2d_init} no_mempool={args.no_mempool}",
         flush=True,
     )
 
     host_init = np.zeros(args.n, dtype=np.float32) if args.h2d_init else None
+    pool_scope = wp.ScopedMempool(device, False) if args.no_mempool else contextlib.nullcontext()
 
     bad_count = 0
     reports = 0
     t0 = time.perf_counter()
-    for i in range(args.iters):
-        if args.h2d_init:
-            a = wp.array(data=host_init, device=device, copy=True)
-        else:
-            a = wp.zeros(args.n, dtype=wp.float32, device=device)
-        wp.launch(write_ones, dim=args.n, inputs=[a], device=device, block_dim=BLOCK)
-        wp.synchronize_device(device)
-        got = a.numpy()
-        info = analyze(got, args.n)
-        if info is not None:
-            bad_count += 1
-            if reports < args.max_reports:
-                reports += 1
-                wp.synchronize_device(device)
-                info["repaired_by_reread"] = bool(np.array_equal(a.numpy(), np.ones(args.n, dtype=np.float32)))
-                print(f"DROPPED iter {i}: {info}", flush=True)
-        del a
+    with pool_scope:
+        for i in range(args.iters):
+            if args.h2d_init:
+                a = wp.array(data=host_init, device=device, copy=True)
+            else:
+                a = wp.zeros(args.n, dtype=wp.float32, device=device)
+            wp.launch(write_ones, dim=args.n, inputs=[a], device=device, block_dim=BLOCK)
+            wp.synchronize_device(device)
+            got = a.numpy()
+            info = analyze(got, args.n)
+            if info is not None:
+                bad_count += 1
+                if reports < args.max_reports:
+                    reports += 1
+                    wp.synchronize_device(device)
+                    info["repaired_by_reread"] = bool(np.array_equal(a.numpy(), np.ones(args.n, dtype=np.float32)))
+                    print(f"DROPPED iter {i}: {info}", flush=True)
+            del a
     dt = time.perf_counter() - t0
 
     print(f"\n{bad_count}/{args.iters} launches lost blocks in {dt:.1f}s", flush=True)

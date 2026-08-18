@@ -496,20 +496,37 @@ before its kernel (`wp.array(data=numpy_array)`) does not reproduce it either:
 `block_dropout.py --h2d-init` is clean over **37,000 launches across 8 concurrent
 processes**. So neither the launch nor a preceding H2D is sufficient on its own.
 
-Bisection state, all under 8-way process concurrency:
+### Resolved: it happens only when the memory pool is **disabled**
 
-| workload | result |
+The remaining difference was the memory-pool scoping the test template wraps every copy in.
+`copy_repro.py --mempool {template,on,off,none}`, 8 concurrent processes x 1,500 iterations
+each:
+
+| memory pool during the copy | processes hitting corruption |
 |---|---|
-| `copy_repro.py` -- the test template's copy | **reproduces**, 5-7 of 8 processes |
-| trivial kernel into a device-allocated buffer | clean, 29,000 launches |
-| trivial kernel into an H2D-initialized buffer | clean, 37,000 launches |
+| `template` (`ScopedMempool(True)` then `(False)` -- collapses to **disabled**) | 1 / 8 |
+| `off` -- explicitly **disabled** (`hipMalloc`) | **2 / 8** (one process 7 hits in 1,500) |
+| `on` -- **enabled** (`hipMallocAsync`) | **0 / 8** |
+| `none` -- no scoping, Warp's default, which is **enabled** | **0 / 8** |
 
-What is left in the failing path and absent from the clean probes: the test template wraps
-every copy in `ScopedMempool(dev, True)` + `ScopedMempool(dev, False)` +
-`ScopedMempoolAccess(dev, dev, True)`, so each iteration **toggles the allocator backend
-between `hipMallocAsync` and `hipMalloc` and re-enables device-to-self mempool access** --
-thousands of times, from eight processes at once. `copy_repro.py --mempool
-{template,on,off,none}` bisects exactly that and is the next result to get.
+**The corruption appears if and only if the allocation came from `hipMalloc` rather than
+the stream-ordered pool.** That fits every observation: the leftover values are always
+exactly `0.0`, in a regular 1 KB-per-8 KB lattice, present in device memory after a full
+synchronize. Freshly-`hipMalloc`ed VRAM is **zeroed by the driver's scrubber** before being
+handed out; a scrub that is still in flight, chunked across engines, landing *after* the
+new owner's kernel has written, produces precisely this. Pool allocations reuse memory
+without a fresh scrub, so they are unaffected -- and the contention dependence follows too,
+since a busy device delays the scrub.
+
+**What this means for users**: Warp on `rocm-117` enables memory pools by default (that is
+one of the port's fixes), so ordinary Warp and mujoco_warp code is **not** exposed. The
+failing tests are the ones that deliberately turn pools off to exercise the default
+allocator. Do not disable memory pools on MI350X (`wp.ScopedMempool(device, False)`,
+`WARP_MEMPOOL`-style overrides) on a shared device.
+
+**What to hand AMD**: `hipMalloc` returning memory whose asynchronous zero-scrub is not
+ordered against the new owner's kernel writes, reproducible with 8 concurrent processes.
+Written up as issue 0 in `AMD_ROCM_ISSUES.md`.
 
 Whatever the final mechanism, the user-visible statement is already solid and serious:
 **on MI350X under multi-process load, Warp can silently return partly stale data.**
