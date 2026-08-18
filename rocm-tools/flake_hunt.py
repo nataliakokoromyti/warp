@@ -41,7 +41,7 @@ def _background_load(stop_flag, device_alias):
 
 
 class _Harness(unittest.TestCase):
-    def runTest(self):  # noqa: N802
+    def runTest(self):
         pass
 
 
@@ -128,7 +128,7 @@ def main():
     for i in range(args.iters):
         try:
             run()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             failures.append((i, repr(e)))
             print(f"--- ITER {i} FAILED ---", flush=True)
             traceback.print_exc()

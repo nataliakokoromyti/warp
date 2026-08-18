@@ -142,7 +142,10 @@ def main():
 
     wp.init()
     device = wp.get_device("cuda:0")
-    print(f"device: {device} arch_str={getattr(device, 'arch_str', device.arch)} is_hip={getattr(device, 'is_hip', False)}", flush=True)
+    print(
+        f"device: {device} arch_str={getattr(device, 'arch_str', device.arch)} is_hip={getattr(device, 'is_hip', False)}",
+        flush=True,
+    )
 
     a = wp.zeros(N, dtype=wp.float32, device=device)
     # warm up / compile

@@ -4,8 +4,9 @@ Reproduces ``test_copy_i2c_d2d_SrcPoolOn_DstPoolOff_Stream0_NoGrad_Graph_AccessD
 (indexed source -> contiguous destination, same device, explicit non-default
 stream, graph capture) in a tight loop, and on every mismatch reports:
 
-* the index of the first mismatch and how many leading elements were correct
-  (the reported failure signature was "correct prefix, zeros after"), and
+* the index of the first mismatch (the archived failure was a **zero prefix**
+  of 125,184 elements with a correct suffix -- the signature of a
+  device-to-host read that started before the producing kernel finished), and
 * whether a full device synchronize followed by a re-read *heals* the array.
 
 A self-healing mismatch proves a missing ordering edge (race), not a lost
@@ -129,7 +130,10 @@ def main():
 
     wp.init()
     device = wp.get_device("cuda:0")
-    print(f"device: {device} arch={device.arch} graph_capture={getattr(device, 'supports_graph_capture', None)}", flush=True)
+    print(
+        f"device: {device} arch={device.arch} graph_capture={getattr(device, 'supports_graph_capture', None)}",
+        flush=True,
+    )
 
     if args.variants == "target":
         cases = [("indexed", "contiguous", True, True)]
@@ -147,9 +151,7 @@ def main():
     offset = 0
     for src_type, dst_type, own_stream, use_graph in cases:
         name = (
-            f"{src_type}2{dst_type}_"
-            f"{'OwnStream' if own_stream else 'DevStream'}_"
-            f"{'Graph' if use_graph else 'NoGraph'}"
+            f"{src_type}2{dst_type}_{'OwnStream' if own_stream else 'DevStream'}_{'Graph' if use_graph else 'NoGraph'}"
         )
         bad = 0
         details = []

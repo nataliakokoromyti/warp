@@ -108,7 +108,9 @@ def main():
     a = wp.zeros(N, dtype=wp.float32, device=device)
     wp.launch(slow_write, dim=N, inputs=[a, args.spin], device=device)
     wp.synchronize_device(device)
-    eager_ms = time_ms(lambda: (wp.launch(slow_write, dim=N, inputs=[a, args.spin], device=device), wp.synchronize_device(device)))
+    eager_ms = time_ms(
+        lambda: (wp.launch(slow_write, dim=N, inputs=[a, args.spin], device=device), wp.synchronize_device(device))
+    )
     print(f"eager kernel duration: {eager_ms:.2f} ms (spin={args.spin})")
 
     control = run_case(device, args.spin, fork=False, trials=args.trials)

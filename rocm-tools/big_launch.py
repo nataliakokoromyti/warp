@@ -30,7 +30,10 @@ def count_all(result: wp.array(dtype=wp.uint64)):
 def main():
     wp.init()
     device = wp.get_device("cuda:0")
-    print(f"device: {device} arch_str={getattr(device, 'arch_str', device.arch)} is_hip={getattr(device, 'is_hip', False)}", flush=True)
+    print(
+        f"device: {device} arch_str={getattr(device, 'arch_str', device.arch)} is_hip={getattr(device, 'is_hip', False)}",
+        flush=True,
+    )
 
     result = wp.zeros(1, dtype=wp.uint64, device=device)
 
