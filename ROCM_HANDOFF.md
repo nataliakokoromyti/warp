@@ -92,9 +92,11 @@ Validated: full mujoco_warp suite green with both fixes (1,233 passed / 0 failed
 
 Remaining perf levers, in evidence order (see the cross-vendor section for the data):
 **(1) conditional graph nodes** — AMD-blocked, worth ~2-4× on solver-heavy scenes since we
-replay a fixed 10 solver iterations where NVIDIA exits at ~3; **(2) collision kernels** —
-`aloha_sdf` and `unitree_g1_hfield` are the only scenes warm capture did not help, so their
-cost is collision compute; **(3) the 7 residual warm-graph allocations** on hfield.
+replay a fixed 10 solver iterations where NVIDIA exits at ~3; **(2) `_sdf_narrowphase`** —
+the one collision kernel that is slower on AMD (14.0× available, see "Collision compute is
+an AMD strength" below; the rest of the collision stack is *faster* than an L40S, so hfield
+and clutter belong under lever 1); ~~**(3) the 7 residual warm-graph allocations** on
+hfield~~ — fixed.
 Already tried and refuted, with data: MFMA/rocWMMA tile matmul (no gain at mujoco's 16x16
 tiles) and wave-aware block sizing (slower). The scratch cache is a strong upstream
 candidate for google-deepmind/mujoco_warp (CUDA graphs carry the same alloc nodes — 34 of
@@ -454,6 +456,23 @@ same isolated kernel in the same harness, that moves MI350X from **15.9x slower 
 slower**. Repeat controls agree to 0.4%, and the `__launch_bounds__(1024)` row is the
 internal control that pins the mechanism: 1024 *is* the value the compiler already assumed,
 and declaring it explicitly buys nothing.
+
+End to end it is **2.27x on `aloha_sdf`**, with the controls interleaved
+(`rocm-tools/slurm/col_sdf_round4.sbatch`, @8192, 400 steps):
+
+| run | steps/s | `ncon_mean` |
+|---|---|---|
+| stock a / b / c | 40,290 / 50,353 / 45,597 | 16.5138 / 16.5139 / 16.5144 |
+| **prints removed a / b** | **100,753 / 105,486** | 16.5129 / 16.5131 |
+
+`ncon_mean` agrees to five significant figures, and stock-to-stock varies by as much as
+stock-to-patched, so the physics does not move. Two checks say the prints are safe to
+compile out: they **never fire** (an unfiltered 512-world run emits zero `ERROR` lines, so
+the 12x is entirely a compile-time effect and is not hiding a real octree failure), and
+`nacon` after 20 steps differs between two *identical* stock runs by as much as it does
+between stock and patched -- mujoco_warp's SDF scene is run-to-run nondeterministic on ROCm
+at that horizon, which is why the equivalence check has to be made at 1-3 steps against a
+same-horizon control.
 
 The two fixes are not additive, they are alternatives, and the register data says why
 (`rocm-tools/hsaco_regs.py`):

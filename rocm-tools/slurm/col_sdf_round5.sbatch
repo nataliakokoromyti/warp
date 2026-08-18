@@ -48,14 +48,20 @@ guardoct; e2e guardoct
 stock;    e2e stock_b
 guardoct; e2e guardoct_b
 
-echo "=================== contact equivalence (512 worlds, 20 steps)"
-stock;    python $EQ $SDF --nworld=512 --nconmax=32 --njmax=226 --steps=20 --out=$TMPDIR/stock.npz 2>&1 | tail -3
-stock;    python $EQ $SDF --nworld=512 --nconmax=32 --njmax=226 --steps=20 --out=$TMPDIR/stock2.npz 2>&1 | tail -3
-guardoct; python $EQ $SDF --nworld=512 --nconmax=32 --njmax=226 --steps=20 --out=$TMPDIR/go.npz 2>&1 | tail -3
-echo "--- control: stock vs stock (run-to-run floor)"
-python $EQ --compare $TMPDIR/stock.npz $TMPDIR/stock2.npz
-echo "--- guarded+oct vs stock"
-python $EQ --compare $TMPDIR/stock.npz $TMPDIR/go.npz
+# Contact equivalence. The SDF gradient descent is chaotic and mujoco_warp is
+# run-to-run nondeterministic on ROCm, so a long horizon compares noise: two
+# identical stock runs already disagree on contact count after 20 steps. Compare
+# at 1 and 3 steps, always against a stock-vs-stock control at the same horizon.
+for N in 1 3 20; do
+  echo "=================== contact equivalence (512 worlds, $N step(s))"
+  stock;    python $EQ $SDF --nworld=512 --nconmax=32 --njmax=226 --steps=$N --out=$TMPDIR/s1_$N.npz 2>&1 | grep -E "^#|wrote"
+  stock;    python $EQ $SDF --nworld=512 --nconmax=32 --njmax=226 --steps=$N --out=$TMPDIR/s2_$N.npz 2>&1 | grep -E "^#|wrote"
+  guardoct; python $EQ $SDF --nworld=512 --nconmax=32 --njmax=226 --steps=$N --out=$TMPDIR/go_$N.npz 2>&1 | grep -E "^#|wrote"
+  echo "--- CONTROL stock vs stock, steps=$N"
+  python $EQ --compare $TMPDIR/s1_$N.npz $TMPDIR/s2_$N.npz || true
+  echo "--- TEST guarded+oct vs stock, steps=$N"
+  python $EQ --compare $TMPDIR/s1_$N.npz $TMPDIR/go_$N.npz || true
+done
 
 echo "=================== registers"
 python $A/bin/hsaco_regs.py $XDG_CACHE_HOME/warp --filter collision_sdf
