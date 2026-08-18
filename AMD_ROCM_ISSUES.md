@@ -150,9 +150,17 @@ What we would like from AMD: either `hipGraphAddMemFreeNode` accepting captured
 `hipFreeAsync` on a capturing stream is guaranteed to record.
 
 Repro: remove the `not d.is_hip` filter at the top of `warp/tests/test_graph.py` and run
-`python warp/tests/test_graph.py TestGraph.test_cuda_graph_alloc_transient_stream_cuda_0`;
-`rocm-tools/graph_alloc_fault.py` isolates the ingredients (temporary vs device stream,
-with and without capture-time fills, large vs small buffers).
+`python warp/tests/test_graph.py TestGraph.test_cuda_graph_alloc_transient_stream_cuda_0`.
+`rocm-tools/graph_alloc_fault.py` isolates the ingredients; measured on MI350X, the fault
+requires an in-capture free **and** a side stream **and** a large buffer:
+
+| case | result |
+|---|---|
+| side-stream allocation, no free | OK |
+| side-stream allocation + in-capture free | **GPU fault** |
+| same, `hipMalloc`-only (no fill kernels) | **GPU fault** |
+| same, allocation on the capturing stream instead | OK |
+| same side stream, 1/1024th the size | OK |
 
 ---
 

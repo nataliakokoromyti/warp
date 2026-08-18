@@ -482,8 +482,24 @@ is precisely "the buffer reads back partly zero" (every async-copy test initiali
 destination by copying `np.zeros` into it, so a stale in-flight write of zeros landing on
 recycled memory produces the observed zero prefix).
 
-**Read of the root cause** (`warp/native/warp.cu`, `wp_free_device_async`, the graph-alloc
-branch). The two backends order an in-capture free very differently:
+**Decomposed** with `rocm-tools/graph_alloc_fault.py` (one process per case, since a fault
+kills the process). Each case begins a capture and allocates inside it:
+
+| case | result |
+|---|---|
+| allocate on a temp side stream, **no free** | OK |
+| allocate on a temp side stream **and free** | **GPU_FAULT** |
+| same, but `wp.empty` so **no capture-time fill kernels** run | **GPU_FAULT** |
+| same, but on the **device's own stream** instead of a temp stream | OK |
+| same temp stream, **1/1024th the buffer size** | OK |
+
+So the fault needs three things together: an in-capture free, an allocation used on a
+*side* stream, and a buffer big enough for the race to open. It is **not** caused by the
+port's kernel-only capture (the no-fill case still faults), and it disappears entirely when
+the allocation stays on the capture stream.
+
+**Root cause** (`warp/native/warp.cu`, `wp_free_device_async`, the graph-alloc branch).
+The two backends order an in-capture free very differently:
 
 - **CUDA**: `cudaGraphAddMemFreeNode(&free_node, graph, alloc_leaf_nodes, ...)` where
   `alloc_leaf_nodes` is *every leaf node descended from the alloc node*. The free is
