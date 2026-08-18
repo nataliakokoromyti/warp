@@ -685,3 +685,135 @@ index 55fe2cf..36ab229 100644
      if not wp.is_conditional_graph_supported():
        warnings.warn(
          """
+diff --git a/mujoco_warp/_src/collision_sdf.py b/mujoco_warp/_src/collision_sdf.py
+index 7ab8bf3..a707705 100644
+--- a/mujoco_warp/_src/collision_sdf.py
++++ b/mujoco_warp/_src/collision_sdf.py
+@@ -15,6 +15,8 @@
+ 
+ from typing import Tuple
+ 
++import os as _os
++
+ import warp as wp
+ 
+ from mujoco_warp._src.collision_core import CollisionContext
+@@ -36,6 +38,15 @@ from mujoco_warp._src.warp_util import event_scope
+ 
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+ 
++# Device-side error diagnostics below are on unreachable paths, but they are not
++# free: on HIP every wp.printf lowers to an OCKL hostcall, which the compiler
++# must treat as an opaque memory-clobbering call and spill live values across.
++# Six of them inside the octree walk drive _sdf_narrowphase's register demand and
++# cost 12x on gfx950. Compile them out by default; MJW_SDF_DEBUG_PRINT=1 brings
++# them back.
++_SDF_DEBUG_PRINT = bool(int(_os.environ.get("MJW_SDF_DEBUG_PRINT", "0")))
++
++
+ 
+ @wp.struct
+ class OptimizationParams:
+@@ -301,7 +312,8 @@ def user_sdf(p: wp.vec3, attr: vec_pluginattr, sdf_type: int) -> float:
+ 
+   Access attributes via attr[i] where i is the attribute index (0 to _NPLUGINATTR-1).
+   """
+-  wp.printf("ERROR: user_sdf function must be implemented by user code\n")
++  if _SDF_DEBUG_PRINT:
++    wp.printf("ERROR: user_sdf function must be implemented by user code\n")
+   return 0.0
+ 
+ 
+@@ -311,7 +323,8 @@ def user_sdf_grad(p: wp.vec3, attr: vec_pluginattr, sdf_type: int) -> wp.vec3:
+ 
+   Access attributes via attr[i] where i is the attribute index (0 to _NPLUGINATTR-1).
+   """
+-  wp.printf("ERROR: user_sdf_grad function must be implemented by user code\n")
++  if _SDF_DEBUG_PRINT:
++    wp.printf("ERROR: user_sdf_grad function must be implemented by user code\n")
+   return wp.vec3(0.0)
+ 
+ 
+@@ -331,7 +344,8 @@ def find_oct(
+     node = stack
+ 
+     if node == -1:
+-      wp.printf("ERROR: Invalid node number\n")
++      if _SDF_DEBUG_PRINT:
++        wp.printf("ERROR: Invalid node number\n")
+       return -1, (rx, ry, rz)
+ 
+     vmin = oct_aabb[node, 0] - oct_aabb[node, 1]
+@@ -351,17 +365,17 @@ def find_oct(
+ 
+     # check if the node is a leaf
+     # child indices are relative to root (mesh_octadr offset)
+-    child0 = oct_child[node][0]
++    node_children = oct_child[node]
+     # Evaluate this hot leaf predicate eagerly to avoid branch-heavy codegen.
+     if (
+-      int(child0 == -1)
+-      & int(oct_child[node][1] == -1)
+-      & int(oct_child[node][2] == -1)
+-      & int(oct_child[node][3] == -1)
+-      & int(oct_child[node][4] == -1)
+-      & int(oct_child[node][5] == -1)
+-      & int(oct_child[node][6] == -1)
+-      & int(oct_child[node][7] == -1)
++      int(node_children[0] == -1)
++      & int(node_children[1] == -1)
++      & int(node_children[2] == -1)
++      & int(node_children[3] == -1)
++      & int(node_children[4] == -1)
++      & int(node_children[5] == -1)
++      & int(node_children[6] == -1)
++      & int(node_children[7] == -1)
+     ) != 0:
+       for j in range(8):
+         if not grad:
+@@ -381,10 +395,23 @@ def find_oct(
+     x = 0 if coord[0] < 0.5 else 1
+     y = 0 if coord[1] < 0.5 else 1
+     z = 0 if coord[2] < 0.5 else 1
+-    child = oct_child[node][4 * z + 2 * y + x]
++    # Static-index the child vector. A dynamic index into an 8-wide register
++    # value has no hardware support on AMD GPUs and spills it to scratch inside
++    # this hot descent loop; an explicit select chain keeps it in registers.
++    octant = 4 * z + 2 * y + x
++    children = oct_child[node]
++    child = children[0]
++    child = wp.where(octant == 1, children[1], child)
++    child = wp.where(octant == 2, children[2], child)
++    child = wp.where(octant == 3, children[3], child)
++    child = wp.where(octant == 4, children[4], child)
++    child = wp.where(octant == 5, children[5], child)
++    child = wp.where(octant == 6, children[6], child)
++    child = wp.where(octant == 7, children[7], child)
+     stack = child + root if child != -1 else -1
+ 
+-  wp.print("ERROR: Node not found\n")
++  if _SDF_DEBUG_PRINT:
++    wp.print("ERROR: Node not found\n")
+   return -1, (rx, ry, rz)
+ 
+ 
+@@ -507,7 +534,8 @@ def sdf(type: int, p: wp.vec3, attr: vec_pluginattr, sdf_type: int, volume_data:
+       return user_sdf(p, attr, sdf_type)
+   elif type == GeomType.MESH and volume_data.valid:
+     return sample_volume_sdf(p, volume_data)
+-  wp.printf("ERROR: SDF type not implemented\n")
++  if _SDF_DEBUG_PRINT:
++    wp.printf("ERROR: SDF type not implemented\n")
+   return 0.0
+ 
+ 
+@@ -558,7 +586,8 @@ def sdf_grad(
+       return user_sdf_grad(p, attr, sdf_type)
+   elif type == GeomType.MESH and volume_data.valid:
+     return sample_volume_grad(p, volume_data)
+-  wp.printf("ERROR: SDF grad type not implemented\n")
++  if _SDF_DEBUG_PRINT:
++    wp.printf("ERROR: SDF grad type not implemented\n")
+   return wp.vec3(0.0)
+ 
+ 
