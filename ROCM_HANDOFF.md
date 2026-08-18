@@ -247,27 +247,35 @@ decomposes into init / loop / one conditional tail launch, and `m.opt.iterations
 makes it skip exactly the loop; the solver context it needs already persists on `Data`
 thanks to the scratch cache.
 
-| | MI350X | L40S |
-|---|---|---|
-| franka, monolithic warm graph | 6.525 ms | 2.480 ms |
-| franka, chunked stepper (chunk=1) | **1.693 ms** | 2.488 ms |
-| **speedup** | **3.85x** | 1.00x |
+Validated on both vendors (chunk=1; chunk=2 is slightly worse since these scenes converge
+in one iteration):
 
-3.85x on HIP against the 4.24x theoretical ceiling (the shortfall is the per-chunk sync),
-and **1.00x on CUDA** -- it costs nothing where conditional nodes already exist, which
-makes it viable as an upstream contribution rather than an AMD-only fork.
+| scene | MI350X reference | MI350X chunked | **speedup** | ceiling | L40S speedup |
+|---|---|---|---|---|---|
+| franka | 6.546 ms | **1.688 ms** | **3.88x** | 4.24x | 1.00x |
+| humanoid | 4.703 ms | **1.573 ms** | **2.99x** | 3.38x | 1.00x |
+| unitree_g1_flat | 5.540 ms | 5.319 ms | 1.04x | 1.14x | 1.00x |
 
-Faithfulness is established, not assumed. Comparing 10 steps from an aligned start against
-unmodified `mjw.step`, with a control of a second independent `mjw.step` run:
+Each lands just under its measured ceiling -- the shortfall is the per-chunk host sync --
+and costs nothing on CUDA, where conditional nodes already do this in hardware.
+
+Faithfulness, checked against unmodified `mjw.step` over 10 steps from an aligned start,
+with a control of a second independent `mjw.step` run (MI350X):
 
 | scene | chunked vs ref | ref vs ref (control) |
 |---|---|---|
-| franka | 4.547e-13 | 4.547e-13 |
-| humanoid | 5.132e-07 | 5.532e-07 |
-| unitree_g1_flat | 2.362e-06 | 2.667e-06 |
+| franka | **0.000e+00** (bit-identical) | 0.000e+00 |
+| humanoid | 6.079e-07 | 5.839e-07 |
+| unitree_g1_flat | 2.327e-06 | 2.428e-06 |
 
-The chunked deviation is at or below mujoco_warp's own run-to-run nondeterminism (atomic
-accumulation order) -- in two scenes it is *closer* to the reference than a repeat run is.
+franka is exact; the others sit inside mujoco_warp's own run-to-run nondeterminism. Same
+picture on the L40S (4.5e-13 / 5.1e-07 / 2.4e-06 against controls of the same magnitude).
+
+**Projected suite impact** (applying the measured per-scene speedups to the warm sweep --
+a projection, the stepper is not wired into `testspeed`): franka 5.08M -> ~19.7M steps/s
+vs L40S 22.2M (**1.13x**), humanoid 1.40M -> ~4.18M vs 5.47M (**1.31x**), g1_flat 1.51M ->
+~1.57M vs 2.12M (1.35x). That would put these three scenes near parity with the L40S,
+versus 4.37x / 3.92x / 1.41x today.
 
 **Status**: prototype, not landed in the library. Productionizing means deciding how users
 opt in (mujoco_warp's `step()` is monolithic by design), and the AMD-side timing rerun with
