@@ -33,7 +33,7 @@ import numpy as np
 
 import warp as wp
 
-BLOCK = 256
+DEFAULT_BLOCK = 256
 
 
 @wp.kernel
@@ -42,19 +42,36 @@ def write_ones(a: wp.array(dtype=wp.float32)):
     a[tid] = 1.0
 
 
-def analyze(got, n):
+def analyze(got, n, block):
     bad = np.flatnonzero(got != 1.0)
     if bad.size == 0:
         return None
-    blocks = sorted(set((bad // BLOCK).tolist()))
+    blocks = sorted(set((bad // block).tolist()))
     residues = sorted({b % 8 for b in blocks})
     whole = all(
-        int(np.count_nonzero(got[b * BLOCK : (b + 1) * BLOCK] != 1.0)) in (BLOCK, n - b * BLOCK) for b in blocks
+        int(np.count_nonzero(got[b * block : (b + 1) * block] != 1.0)) in (block, n - b * block) for b in blocks
     )
+    runs = []
+    run_starts = []
+    start = prev = int(bad[0])
+    for raw in bad[1:]:
+        idx = int(raw)
+        if idx != prev + 1:
+            runs.append(prev - start + 1)
+            run_starts.append(start)
+            start = idx
+        prev = idx
+    runs.append(prev - start + 1)
+    run_starts.append(start)
+    byte_stride = (run_starts[1] - run_starts[0]) * 4 if len(run_starts) > 1 else None
     return {
         "bad_elems": int(bad.size),
         "bad_blocks": len(blocks),
-        "total_blocks": (n + BLOCK - 1) // BLOCK,
+        "total_blocks": (n + block - 1) // block,
+        # The discriminator: if the damage tracks thread blocks it scales with block_dim;
+        # if it tracks a fixed byte lattice (e.g. a DMA/scrub chunking) it does not.
+        "run_bytes": sorted({r * 4 for r in runs})[:4],
+        "run_stride_bytes": byte_stride,
         "whole_blocks_missing": whole,
         "block_residues_mod8": residues,
         "first_blocks": blocks[:6],
@@ -67,6 +84,7 @@ def main():
     parser.add_argument("--iters", type=int, default=3000)
     parser.add_argument("--n", type=int, default=1000000)
     parser.add_argument("--max-reports", type=int, default=5)
+    parser.add_argument("--block-dim", type=int, default=DEFAULT_BLOCK)
     parser.add_argument(
         "--no-mempool",
         action="store_true",
@@ -86,7 +104,8 @@ def main():
     wp.init()
     device = wp.get_device("cuda:0")
     print(
-        f"device: {device} n={args.n} blocks={(args.n + BLOCK - 1) // BLOCK} "
+        f"device: {device} n={args.n} block_dim={args.block_dim} "
+        f"blocks={(args.n + args.block_dim - 1) // args.block_dim} "
         f"iters={args.iters} h2d_init={args.h2d_init} no_mempool={args.no_mempool}",
         flush=True,
     )
@@ -103,10 +122,10 @@ def main():
                 a = wp.array(data=host_init, device=device, copy=True)
             else:
                 a = wp.zeros(args.n, dtype=wp.float32, device=device)
-            wp.launch(write_ones, dim=args.n, inputs=[a], device=device, block_dim=BLOCK)
+            wp.launch(write_ones, dim=args.n, inputs=[a], device=device, block_dim=args.block_dim)
             wp.synchronize_device(device)
             got = a.numpy()
-            info = analyze(got, args.n)
+            info = analyze(got, args.n, args.block_dim)
             if info is not None:
                 bad_count += 1
                 if reports < args.max_reports:
