@@ -1104,8 +1104,37 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
             // hipGraphAddMemAllocNode on explicitly constructed graphs.
             // Use hipFreeAsync on the capturing stream instead, the stream capture
             // mechanism records it as a proper free node in the graph.
+            //
+            // On its own that records a free node depending only on the capture
+            // stream's current frontier. The CUDA path below instead names every leaf
+            // node descended from the alloc node as a dependency, so the free is ordered
+            // after *all* uses of the allocation on *any* stream in the capture. Without
+            // that, an allocation used on a side stream (a wp.ScopedStream block inside a
+            // capture, which does not join back on exit) has no edge from its kernels to
+            // the free node, and replay unmaps the memory while they are still reading it
+            // -- a GPU memory access fault, seen on MI350X in
+            // test_cuda_graph_alloc_transient_stream. Add those leaves to the capture
+            // stream's dependency set before issuing the free so the recorded free node
+            // carries the same ordering.
             {
                 CaptureInfo* capture = capture_iter->second;
+                std::vector<cudaGraphNode_t> alloc_leaf_nodes;
+                if (alloc_info.node && get_dependent_leaf_nodes(alloc_info.node, alloc_leaf_nodes)
+                    && !alloc_leaf_nodes.empty()) {
+                    // Add, not set: the capture stream's own frontier must stay a
+                    // dependency so its ordering is preserved.
+                    check_cu(cuStreamUpdateCaptureDependencies_f(
+                        capture->stream, alloc_leaf_nodes.data(), alloc_leaf_nodes.size(),
+                        CU_STREAM_ADD_CAPTURE_DEPENDENCIES
+                    ));
+                } else if (!alloc_info.node) {
+                    fprintf(
+                        stderr,
+                        "Warp warning: %s: no allocation node for an in-capture free; the free may not "
+                        "be ordered after uses of the allocation on other streams\n",
+                        __FUNCTION__
+                    );
+                }
                 check_cuda(cudaFreeAsync(ptr, capture->stream));
             }
 #else
