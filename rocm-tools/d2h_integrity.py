@@ -84,6 +84,12 @@ def main():
     parser.add_argument("--pinned", action="store_true", help="read into a pinned host buffer")
     parser.add_argument("--load", type=int, default=0)
     parser.add_argument("--max-reports", type=int, default=8)
+    parser.add_argument(
+        "--no-rewrite",
+        action="store_true",
+        help="do not re-run the producing kernel before each readback (A/B control: if the "
+        "corruption is chunks of the transfer racing the producing kernel, this should be clean)",
+    )
     args = parser.parse_args()
 
     workers = []
@@ -117,6 +123,13 @@ def main():
     reports = 0
     t0 = time.perf_counter()
     for i in range(args.iters):
+        # Re-run the producing kernel each iteration, with no explicit sync, so the
+        # readback is issued while a write to the same buffer is still in flight. That
+        # is the pattern every failing test has (interpolate/copy, then .numpy()), and
+        # it is the window a chunked transfer could race into.
+        if not args.no_rewrite:
+            src.zero_()
+            wp.launch(fill_ramp, dim=args.n, inputs=[src, base], device=device)
         if args.pinned:
             wp.copy(host, src)
             wp.synchronize_device(device)
@@ -129,10 +142,16 @@ def main():
             if reports < args.max_reports:
                 reports += 1
                 zeros = int(np.count_nonzero(got[bad_idx] == 0.0))
-                print(f"CORRUPT iter {i}: all_bad_are_zero={zeros == bad_idx.size} {describe(bad_idx, args.n)}", flush=True)
-            # re-read to see whether the device data itself is intact
+                print(
+                    f"CORRUPT iter {i}: all_bad_are_zero={zeros == bad_idx.size} {describe(bad_idx, args.n)}",
+                    flush=True,
+                )
+            # re-read after a full sync: if the device buffer is intact, the loss was
+            # in the transfer, not in the kernel that produced it
+            wp.synchronize_device(device)
             again = src.numpy()
-            print(f"        re-read matches: {np.array_equal(again, want)}", flush=True)
+            if reports <= args.max_reports:
+                print(f"        re-read after sync matches: {np.array_equal(again, want)}", flush=True)
     dt = time.perf_counter() - t0
 
     if stop_flag is not None:
