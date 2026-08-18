@@ -37,17 +37,27 @@ Every corrupted-element count we have ever seen falls out of that: 489x256 = 125
 between occurrences (first bad block at 0, 256, 512, 1792, 12288, ...). In bytes the
 pattern is **1 KB lost out of every 8 KB**.
 
-**What it is not**: a trivial `a[tid] = 1.0` kernel writing into a device-allocated
-(`hipMallocAsync` + device fill) buffer does **not** reproduce it -- 0 in 29,000 launches
-across 8 concurrent processes -- so this is not simply "a launch loses workgroups", and the
-8-XCD workgroup distribution (the machine runs in SPX / NPS1) is not on its own the
-explanation.
+**Bisected to the allocator.** Running the same workload in 8 concurrent processes with
+only the allocation path changed:
 
-**What every failing case does have** is a **multi-megabyte host-to-device copy of pageable
-memory immediately before the kernel** whose output goes missing (`wp.array(data=numpy_array)`
-in our case), and the leftover bytes are exactly the H2D source values. That points at a
-chunked H2D transfer completing *after* the kernel that the stream ordered behind it, with
-the interleave granularity of the split showing up as the 1 KB / 8 KB lattice.
+| allocation used for the buffer | processes hitting corruption |
+|---|---|
+| `hipMalloc` (memory pool disabled) | **2 / 8**, up to 7 hits in 1,500 iterations |
+| `hipMallocAsync` (memory pool enabled) | **0 / 8** |
+
+Controls that are clean, all at 8-way concurrency: a trivial `a[tid] = 1.0` kernel into a
+pool-allocated buffer (0 in 29,000 launches), and the same with a multi-MB pageable H2D
+initialization first (0 in 37,000). So it is neither a workgroup-scheduling problem nor an
+H2D ordering problem, and the 8-XCD workgroup distribution (this machine runs SPX / NPS1)
+is not the explanation either -- **it only happens to memory that came from `hipMalloc`.**
+
+**Our read**: freshly-`hipMalloc`ed VRAM is zeroed by the driver's scrubber before being
+handed to the application. If that scrub is still in flight when the new owner's kernel
+writes -- chunked across engines, which would explain the 1 KB / 8 KB lattice -- the
+scrubber's zeros land *after* the kernel's data. Every observation fits: the surviving
+values are always exactly `0.0`; they are in device memory after a full synchronize; pool
+allocations, which reuse memory without a fresh scrub, are immune; and a busy device, which
+delays the scrub, is what makes it appear.
 
 **Trigger**: process-level concurrency on a single device. One process is clean over 6,000
 iterations; **eight concurrent processes doing the same work hit it in 5-7 of 8**, at
@@ -55,15 +65,21 @@ roughly one launch in 1,500-10,000 per process. Nothing about the kernel matters
 reproduces with and without graph capture, on the device's stream and on a user stream, and
 on whichever buffer a kernel most recently wrote.
 
-**Impact for us**: a full Warp test suite run trips it in ~60% of runs, and it is a silent
-wrong-answer bug, not a crash. Any multi-tenant MI350X workload -- which is the normal way
-these machines are used -- is exposed.
+**Impact**: a full Warp test suite run trips it in ~60% of runs, and it is a silent
+wrong-answer bug, not a crash. Applications that keep memory pools enabled are not exposed,
+which limits the blast radius -- but `hipMalloc` is the documented, default way to allocate
+device memory, and any multi-tenant MI350X workload using it can silently read back zeros
+where it wrote data.
 
-**Repro**: `rocm-tools/copy_repro.py` and `rocm-tools/block_dropout.py --h2d-init`; run
-eight copies concurrently against one GPU. Machine state when reproducing: Compute
-Partition **SPX**, Memory Partition **NPS1**, `HSA_XNACK` and `GPU_MAX_HW_QUEUES` unset.
-Please tell us what else to capture, and whether a chunked pageable H2D is expected to be
-fully ordered against subsequent work on the same stream.
+**Repro**: `rocm-tools/block_dropout.py --no-mempool` (allocate ~4 MB with `hipMalloc`,
+launch a kernel writing 1.0 to every element, synchronize, read back, look for zeros) and
+`rocm-tools/copy_repro.py --mempool off`; run eight copies concurrently against one GPU.
+Machine state when reproducing: Compute Partition **SPX**, Memory Partition **NPS1**,
+`HSA_XNACK` and `GPU_MAX_HW_QUEUES` unset, ROCm 7.2.0 bare metal.
+
+**Question for AMD**: is the VRAM scrub on a fresh `hipMalloc` guaranteed to be complete,
+or ordered against subsequent stream work, before the pointer is returned? If so, what
+breaks that guarantee under concurrent multi-process load?
 
 ---
 
