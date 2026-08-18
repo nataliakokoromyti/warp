@@ -1,7 +1,7 @@
 # Warp + mujoco_warp on MI350X — collaborator handoff
 
 *Goal: make Warp (and by extension mujoco_warp) fully validated and **super optimized** on
-AMD Instinct MI350X (gfx950). Status as of 2026-08-17.*
+AMD Instinct MI350X (gfx950). Status as of 2026-08-18.*
 
 ## What this branch is
 
@@ -16,7 +16,10 @@ HIP graph-capture PR #15 + our fixes; fully validated but frozen. Full backgroun
 
 ## Current state — what's proven (rocm-117, MI350X / ROCm 7.2.0, bare-metal)
 
-- **Warp full test suite: 8,294 tests, 0 failures / 0 errors** (240 principled skips).
+- **Warp full test suite: 8,294 tests, 0 failures / 0 errors** (240 principled skips) --
+  but see "The two intermittent suite failures" below: repeating the suite trips a real
+  MI350X data-corruption bug in ~60% of runs, so a single green run is weak evidence.
+  Do not quote a lone green suite as proof.
 - **google-deepmind/mujoco_warp main: 1,233 passed / 0 failed / 30 skips** — now
   **including all render tests**: CDNA software-sampled texture fallback works, where the
   1.13 branch disabled rendering entirely. (Needs `patches/mujoco_warp-rocm-compat.patch`.)
