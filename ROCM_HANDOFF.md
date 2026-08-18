@@ -221,10 +221,20 @@ vs the same tree with our compat patch applied:
 | **tests failing only with our patch** | **none** |
 
 So the patch is a no-op for CUDA correctness while removing 34 alloc nodes from the L40S
-warm-captured graph. (The wall-clock difference between the two runs in that job -- 16:44
-vs 5:53 -- is **not** a patch speedup: they shared a per-job Warp kernel cache and the
-pristine run went first, paying all the JIT compilation. A reversed-order control is
-running to isolate the real effect; do not quote the raw timings.)
+warm-captured graph.
+
+**Do not quote suite wall-clock as a patch speedup.** The first A/B appeared to show the
+patch making the suite 2.84x faster (16:44 pristine vs 5:53 patched). It does not: the two
+runs shared a per-job Warp kernel cache, so the second run inherited warm JIT artifacts. A
+reversed-order control proved it -- whichever suite ran *second* took ~5.5 min either way:
+
+| run order | first | second |
+|---|---|---|
+| pristine -> patched | pristine 16:44 | patched **5:53** |
+| patched -> pristine | patched 11:27 | pristine **5:24** |
+
+Suite wall-clock here measures JIT compilation, not physics. The patch's real perf effect
+is in the graph-node counts and per-step timings elsewhere in this document.
 
 ### Prototype: recovering the conditional-node win without AMD (2026-08-17)
 
