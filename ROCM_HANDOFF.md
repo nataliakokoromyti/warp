@@ -1,7 +1,7 @@
 # Warp + mujoco_warp on MI350X — collaborator handoff
 
 *Goal: make Warp (and by extension mujoco_warp) fully validated and **super optimized** on
-AMD Instinct MI350X (gfx950). Status as of 2026-08-17.*
+AMD Instinct MI350X (gfx950). Status as of 2026-08-18.*
 
 ## What this branch is
 
@@ -353,7 +353,7 @@ and every other scene's stepper delta sits at its control:
 
 (hfield's absolute numbers are large because the scene is chaotic over 10 steps -- the
 control is the point, not the magnitude.) Same picture on the L40S in both modes. A probe
-(`pendula_probe.py`, not committed) confirmed the mechanism directly: a Stepper pinned to
+(`rocm-tools/stepper_niter_probe.py`) confirmed the mechanism directly: a Stepper pinned to
 `chunk=iterations`, which runs *exactly* what the unrolled reference runs, differs from the
 reference by the same amount as `chunk=1` does. The residual is nondeterminism, not the
 split.
