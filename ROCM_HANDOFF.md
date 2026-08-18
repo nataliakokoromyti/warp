@@ -384,6 +384,13 @@ evidence.
 | archive `16812542` | `test_implicit_fields` | 3 / 9 | 6 |
 | hunt run 3 | `test_copy_i2c_d2d_SrcPoolOn_DstPoolOff_**NoStream**_NoGrad_**NoGraph**_AccessBoth` | 124,992 / 1,000,000 (12.5%) | 512 |
 | hunt run 4 | `test_copy_i2fi_**d2h**_SrcPoolOff_DstPoolOff_NoStream_NoGrad_NoGraph_AccessNone` | 124,928 / 1,000,000 (12.5%) | 1,280 |
+| hunt run 5 | `test_copy_fi2fi_d2d_SrcPoolOn_DstPoolOff_Stream0_NoGrad_Graph_AccessNone` | 125,184 / 1,000,000 (12.5%) | 256 -- **and the zeros were on the `src.numpy()` side** |
+| hunt run 5 | `test_implicit_fields` (same run, second failure) | 3 / 9 | 6 |
+
+Run 5 is the decisive one. The assertion is `assert_np_equal(dst.numpy(), src.numpy())`,
+and there the zeros were on the **DESIRED** side -- i.e. **`src.numpy()`** came back
+partly zero while `dst` held the correct values. The array being read is not the array the
+test was writing to. Whatever is failing is the **readback**, not the copy under test.
 
 **The reproduction refutes the ordering hypothesis.** The new failures use **no graph and
 no explicit stream** -- there is no cross-stream construct left to mis-order. What survives
