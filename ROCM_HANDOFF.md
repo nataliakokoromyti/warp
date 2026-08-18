@@ -389,7 +389,7 @@ written, giving a zero *suffix*. Neither is a lost write.
 | probe | result |
 |---|---|
 | `capture_fork_join.py` -- does a captured cross-stream fork/join (the shape `wp.copy()` builds for non-contiguous arrays) actually order? | **PASS**, 20/20. A 27 ms kernel on the forked branch makes `synchronize_stream()` block the full 27 ms, so the join edge is honored. |
-| `null_stream_sync.py` -- 7 shapes of "produce on one stream, read with `.numpy()`, no explicit sync", including graph replay with no sync at all | **0 torn reads / 25 trials each**, both vendors. HIP's null-stream ordering and unpinned-D2H blocking both behave like CUDA's. |
+| `null_stream_sync.py` -- 7 shapes of "produce on one stream, read with `.numpy()`, no explicit sync", including graph replay with no sync at all, plus 400 stress iterations each at n = 9 / 1K / 64K / 1M | **0 torn reads** out of 25 trials per shape and 1,600 stress iterations, both vendors. HIP's null-stream ordering and unpinned-D2H blocking both behave like CUDA's. |
 | `copy_repro.py` -- the exact failing copy configuration, 300 iterations, plus all 32 non-contiguous d2d variants | **0 mismatches**, both vendors. |
 | `flake_hunt.py --test fem_implicit` -- 500 iterations, then 300 more with 3 background GPU-load processes | **0 failures**, both vendors. |
 
@@ -401,10 +401,16 @@ dumps every failure block, which is the right next step -- a single green run do
 clear this.
 
 **Assessment**: real, low-frequency, and *not* explained away. Do not treat a single green
-suite as proof. The most likely remaining candidates, in order: (1) HIP's unpinned D2H
-losing its implicit blocking under multi-process contention; (2) reuse of Warp's per-stream
-`cached_event` (one event per stream, re-recorded on every `wait_stream`/`ScopedStream`
-entry -- legal on CUDA, and a pattern HIP has historically been looser about).
+suite as proof. Leading candidate, found in the gate audit later the same day:
+**mis-ordered mempool frees** (see the `test_graph.py` section). A free that is not ordered
+after the work still reading the buffer lets a later allocation reuse live memory; the
+severe form is the GPU fault that test produces on MI350X, and the mild form is exactly
+this -- a destination that reads back partly zero, because every async-copy test builds its
+destination from `np.zeros` and a stale in-flight zero-fill landing on recycled memory
+produces the observed prefix. Chase that first. Secondary candidate: reuse of Warp's
+per-stream `cached_event` (one event per stream, re-recorded on every
+`wait_stream`/`ScopedStream` entry, and used for exactly this alloc/free ordering) -- legal
+under CUDA's event semantics, worth verifying against HIP's.
 
 ## Test-gate audit (2026-08-18)
 
