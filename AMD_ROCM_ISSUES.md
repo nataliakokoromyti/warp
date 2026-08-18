@@ -60,10 +60,10 @@ allocations, which reuse memory without a fresh scrub, are immune; and a busy de
 delays the scrub, is what makes it appear.
 
 **Trigger**: process-level concurrency on a single device. One process is clean over 6,000
-iterations; **eight concurrent processes doing the same work hit it in 5-7 of 8**, at
-roughly one launch in 1,500-10,000 per process. Nothing about the kernel matters -- it
-reproduces with and without graph capture, on the device's stream and on a user stream, and
-on whichever buffer a kernel most recently wrote.
+iterations; **eight concurrent processes doing the same work hit it in 2-7 of 8**, at
+roughly one occurrence per 1,500-10,000 iterations per process. Nothing about the kernel
+matters -- it reproduces with and without graph capture, on the device's stream and on a
+user stream, and on whichever buffer a kernel most recently wrote.
 
 **Impact**: a full Warp test suite run trips it in ~60% of runs, and it is a silent
 wrong-answer bug, not a crash. Applications that keep memory pools enabled are not exposed,
