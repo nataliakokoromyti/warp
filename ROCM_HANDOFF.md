@@ -6,7 +6,7 @@ AMD Instinct MI350X (gfx950). Status as of 2026-08-17.*
 ## What this branch is
 
 **`rocm-117` (current)** = [AMD-Ecosystem/warp](https://github.com/AMD-Ecosystem/warp)
-`amd-integeration-dev` (AMD's re-port of Warp onto near-current upstream — **Warp
+`amd-integration-dev` (AMD's re-port of Warp onto near-current upstream — **Warp
 1.17.0.dev2**, ~17 commits behind nvidia/warp main as of 2026-08-13) + our fixes ported
 forward. This natively satisfies mujoco_warp's `warp-lang>=1.15` requirement — no shims.
 
@@ -297,9 +297,10 @@ Where the remaining gap actually lives, now that allocation noise is gone:
    plus a conditional node**; ours has **288 unrolled** kernel nodes. NVIDIA's `capture_while`
    exits the solver at convergence (~3 iterations on G1); we must replay the full fixed
    budget (10). This is structural, not tuning, and only AMD can unblock it.
-2. **Collision-dominated scenes.** `aloha_sdf` (12.2x) and `unitree_g1_hfield` (10.4x)
-   barely improved from warm capture -- their cost is collision compute, not allocation.
-   These are the top targets for our own optimization work.
+2. ~~**Collision-dominated scenes.**~~ — **retired 2026-08-18**, see
+   "Collision compute is an AMD strength" below. Isolated per-phase timings on both
+   vendors show collision is *faster* on MI350X in every scene except one, and the sole
+   exception is a single kernel (`_sdf_narrowphase`) with a fixable launch configuration.
 3. ~~Residual warm-graph allocations on hfield~~ — **fixed 2026-08-17**: traced to 7 real
    allocations in `convex_narrowphase` (the EPA polytope scratch + ccd counter, sized from
    `naccdmax`; 11 further calls are zero-sized and allocate nothing). Hoisted into the
@@ -316,6 +317,123 @@ wrong: on franka every wave-aligned override was **slower** (`linesearch_iterati
 `launch_tiled(dim=nworld)` creates one block per world regardless of block size, so raising
 `block_dim` does not fill idle wavefronts -- it assigns more threads to tiles only `nv`
 wide, while reducing blocks resident per CU. Tool: `rocm-tools/blockdim_tune.py`.
+
+### Collision compute is an AMD strength -- except one kernel (2026-08-18)
+
+`aloha_sdf`, `unitree_g1_hfield` and `aloha_clutter` were filed as "collision-dominated"
+because warm capture did not help them. That inference does not hold: warm capture also
+does not help a scene whose cost is the *unrolled solver*, and end-to-end steps/s cannot
+tell the two apart. `rocm-tools/collision_bench.py` measures the collision pipeline on its
+own -- it steps a scene into a representative state, then times `collision(m, d)` in
+isolation and subtracts a run with each narrowphase stubbed out. Same source, same scenes,
+same states, run on both vendors:
+
+| isolated phase, ms/call | MI350X | L40S | L40S / MI350X |
+|---|---|---|---|
+| hfield, whole collision pipeline | 3.469 | 46.944 | **0.074x (AMD 13.5x faster)** |
+| hfield, convex narrowphase (CCD) | 3.189 | 46.564 | **0.068x (AMD 14.6x faster)** |
+| clutter, whole collision pipeline | 1.618 | 3.507 | 0.46x (AMD 2.2x faster) |
+| clutter, convex narrowphase | 0.947 | 2.413 | 0.39x (AMD 2.5x faster) |
+| g1_flat, whole collision pipeline | 0.547 | 0.815 | 0.67x (AMD 1.5x faster) |
+| **aloha_sdf, `_sdf_narrowphase`** | **30.248** | **1.233** | **24.5x (AMD slower)** |
+
+So the CCD/GJK/EPA stack -- the thing wave64 divergence was supposed to punish -- is
+comfortably faster on MI350X, and the broadphase is small either way (AMD is ~3.5x slower
+on the tiny nxn broadphase, 0.19 vs 0.055 ms on hfield: real, but 0.1 ms). Every scene
+except `aloha_sdf` needs to be re-attributed to the solver, not to collision.
+
+The same conclusion from the other direction, using `-o opt.iterations` as a control
+(MI350X, `rocm-tools/slurm/col_iterceil.sbatch`; both scenes configure a **100**-iteration
+budget and converge in 1-3):
+
+| scene | default | iterations=4 | iterations=1 | reading |
+|---|---|---|---|---|
+| aloha_sdf | 38,806 / 38,563 | 36,009 | 29,016 | solver is ~free; **collision is the cost** |
+| aloha_clutter | 87,338 / 86,283 | -- | 126,854 | **1.45x** sits in the unrolled solver |
+
+(Caveat: neither scene replays a control trajectory in this test, so cutting iterations
+changes the physics -- both vendors get *slower* at `iterations=1` because the sim stops
+converging. The same reversal appears on the L40S, so the comparison is still like-for-like;
+just do not read `iterations=1` as a ceiling.)
+
+Where `aloha_sdf`'s time actually goes, from mujoco_warp's own event trace
+(`rocm-tools/etrace_agg.py`, steady-state eager step, MI350X):
+
+| scope | MI350X | L40S |
+|---|---|---|
+| `step` | 34.83 ms | -- |
+| `forward.fwd_position.collision.sdf_narrowphase` | **30.25 ms (87% of the step)** | 1.23 ms |
+| `...collision.convex_narrowphase` | 0.34 | 1.45 |
+| `...collision.primitive_narrowphase` | 0.04 | 0.05 |
+| `...collision.nxn_broadphase` | 0.06 | 0.03 |
+| `forward.solve` | 1.39 | 12.21 |
+
+One kernel, 87% of the step, 24.5x off the L40S. That is the entire `aloha_sdf` gap.
+
+**Root cause: the kernel had no `__launch_bounds__`.** Without it the HIP compiler must
+assume the maximum flat workgroup size (1024 threads = 16 waves resident on one CU = 4
+waves per SIMD), which caps the kernel at 128 VGPRs. `_sdf_narrowphase` inlines the whole
+gradient-descent / Wolfe line-search / octree-sampling stack into one body and wants far
+more than that, so it spills to scratch. Declaring the true block size lifts the cap.
+Measured on `aloha_sdf` @8192, warm graph, controls interleaved
+(`rocm-tools/slurm/col_sdf_sweep.sbatch`):
+
+| config (block_dim, `__launch_bounds__`) | steps/s |
+|---|---|
+| stock (256, none) -- three controls | 32,955 / 35,779 / 33,630 |
+| **256 + `__launch_bounds__(256, 1)`** | **55,269 (1.61x)** |
+| 128 + `__launch_bounds__(128, 1)` | 33,365 |
+| 64 + `__launch_bounds__(64, 1)` | 35,724 |
+| 512 + `__launch_bounds__(512, 1)` | 33,583 |
+| 256 + `__launch_bounds__(256, **2**)` | 33,551 |
+
+Two things worth reading off this table. The winning row launches at Warp's *default* block
+size, so the only difference from the control is the presence of the attribute -- nothing
+about the launch geometry changed. And on HIP the second `__launch_bounds__` argument is
+MIN_WARPS_PER_EXECUTION_UNIT, so `2` halves the register budget to 256 VGPRs: it erases the
+entire win, which pins the kernel's requirement at **>256 VGPRs** against an implicit cap of
+128. (Same trap as the `_CCD_MIN_BLOCKS=8` finding on the hfield CCD kernel -- NVIDIA's
+min-blocks-per-SM semantics do not carry over.)
+
+The compiled binaries say it outright. Reading the AMDGPU metadata note out of the two
+`.cubin`s Warp cached for this kernel (`rocm-tools/hsaco_regs.py`):
+
+| | stock | `__launch_bounds__(256, 1)` |
+|---|---|---|
+| `max_flat_workgroup_size` | 1024 | 256 |
+| `vgpr_count` | **128** (the cap) | **465** |
+| `agpr_count` | 0 | 209 |
+| **`vgpr_spill_count`** | **465** | **0** |
+| `sgpr_spill_count` | 125 | 95 |
+| `private_segment_fixed_size` (scratch) | 21,088 B | 19,104 B |
+
+465 spilled VGPRs, in the innermost loop of a gradient descent that re-samples an octree
+ten times per iteration. Declaring the bound moves all of them back into registers.
+
+**This generalises past mujoco_warp, and the fix belongs in Warp.** Warp compiles a module
+once per `block_dim` and launches it at exactly that width, so it always knows the bound at
+codegen time and simply never emitted it. `warp/_src/codegen.py` now emits
+`WP_DEFAULT_LAUNCH_BOUNDS` for kernels that declare none; the macro expands to
+`__launch_bounds__(WP_TILE_BLOCK_DIM)` under `__HIPCC__` and to nothing otherwise, so
+NVIDIA codegen is semantically unchanged. A/B'd against **stock, unpatched mujoco_warp**,
+two full passes with a separate kernel cache per variant
+(`rocm-tools/slurm/col_warplb.sbatch`):
+
+| scene, steps/s | off (pass 1 / 2) | on (pass 1 / 2) | ratio |
+|---|---|---|---|
+| aloha_sdf | 39,859 / 39,811 | **56,816 / 56,657** | **1.43x** |
+| aloha_clutter | 88,035 / 86,428 | 85,788 / 86,876 | 0.99x |
+| unitree_g1_hfield | 897,540 / 893,224 | 901,664 / 893,297 | 1.00x |
+
+Pass-to-pass spread is under 2%, so both the sdf gain and the two non-regressions are real,
+and no mujoco_warp change is needed. The fix's reach across the rest of the suite is narrow
+but its downside is nil: of 40 code objects in an `aloha_sdf` kernel cache 8 spill, and
+after `_sdf_narrowphase`'s 465 the next worst are `linesearch_iterative` (10) and
+`primitive_narrowphase` (7). It removes a cliff rather than lifting a floor.
+
+Also refuted this round: `rocprofv3 --kernel-trace` is unusable on a captured mujoco_warp
+run -- it hangs on `aloha_sdf` and segfaults with `--output-format csv` (matching the known
+`--stats` hang). Use `collision_bench.py` / the event trace instead.
 
 ### Optimization round findings (2026-08-15)
 
@@ -423,7 +541,7 @@ zhihuidu-amd/hipgraph-ms), `sort_check.py` (segmented sort correctness), `flex_c
 
 AMD actively develops the port (AMD-Ecosystem/warp) and reviews outside fixes; NVIDIA merges
 portability-neutral fixes (see nvidia/warp PR #1702). `rocm-117` sits on AMD's
-`amd-integeration-dev` (~17 commits behind nvidia/warp main as of 2026-08-13) — the 430-commit
+`amd-integration-dev` (~17 commits behind nvidia/warp main as of 2026-08-13) — the 430-commit
 sync gap is closed. Our fix stack on top (~10 commits) is all upstream candidates: the
 `CUDA_CALLABLE` annotations and the cluster arch-string fix are NVIDIA-neutral
 (nvidia/warp); capture enablement, the alloc guard, capture-safe LBVH rebuild, kernel-only
