@@ -373,15 +373,31 @@ D2H copy on the device's null stream and never explicitly synchronizes -- it rel
 CUDA's legacy null-stream ordering plus the documented rule that a D2H copy into *pageable*
 host memory returns only once it has completed.
 
-| | test | signature |
-|---|---|---|
-| `suite117-full-16811062` | `test_copy_i2c_d2d_SrcPoolOn_DstPoolOff_Stream0_NoGrad_Graph_AccessDstSrc` | 125,184 / 1,000,000 mismatched -- a **zero prefix**, correct suffix |
-| `suite117-full-16812542` | `test_implicit_fields` | 3 / 9 mismatched -- correct prefix, **zero suffix** (`[5,5,5,5,5,5,0,0,0]`) |
+Reproduced: **2 failures in the first 4 of 14 repeated full-suite runs**
+(`rocm-tools/slurm/flake_hunt.sbatch`), which puts the rate near 50% per suite run --
+far higher than the archive suggested, and high enough that any single green suite is weak
+evidence.
 
-The two directions are consistent with one cause. A D2H DMA walks the buffer front to
-back, so a reader that starts too early on a large buffer returns a zero *prefix*; a small
-buffer copied in one shot instead captures whichever elements the producing kernel had
-written, giving a zero *suffix*. Neither is a lost write.
+| run | test | mismatched | first bad index |
+|---|---|---|---|
+| archive `16811062` | `test_copy_i2c_d2d_SrcPoolOn_DstPoolOff_Stream0_NoGrad_**Graph**_AccessDstSrc` | 125,184 / 1,000,000 (12.5%) | 0 |
+| archive `16812542` | `test_implicit_fields` | 3 / 9 | 6 |
+| hunt run 3 | `test_copy_i2c_d2d_SrcPoolOn_DstPoolOff_**NoStream**_NoGrad_**NoGraph**_AccessBoth` | 124,992 / 1,000,000 (12.5%) | 512 |
+| hunt run 4 | `test_copy_i2fi_**d2h**_SrcPoolOff_DstPoolOff_NoStream_NoGrad_NoGraph_AccessNone` | 124,928 / 1,000,000 (12.5%) | 1,280 |
+
+**The reproduction refutes the ordering hypothesis.** The new failures use **no graph and
+no explicit stream** -- there is no cross-stream construct left to mis-order. What survives
+is the shape of the damage: on every 1,000,000-element (4 MB) case, ~12.5% of the buffer is
+zero, and the count is a near-exact multiple of 512 elements (124,992 = 244 x 512;
+124,928 = 244 x 512), starting at a 512-element boundary. That is **whole 2 KB chunks of a
+chunked transfer going missing**, not a partially-completed copy and not a torn read at a
+single boundary. Both failing tests fail inside `assert_np_equal(dst.numpy(), ...)`.
+
+So the suspect is now the **device-to-host readback itself** (`array.numpy()` ->
+`hipMemcpyAsync` D2H into pageable host memory, which ROCm stages in chunks), not stream or
+graph ordering. `rocm-tools/d2h_integrity.py` hammers exactly that -- tens of thousands of
+readbacks, printing the run/stride structure of any corruption, with pinned-destination and
+background-load variants to localize it.
 
 **What was tested and did not reproduce it** (all on MI350X, rocm-117; every probe is in
 `rocm-tools/` and each has a clean L40S control):
@@ -393,24 +409,24 @@ written, giving a zero *suffix*. Neither is a lost write.
 | `copy_repro.py` -- the exact failing copy configuration, 300 iterations, plus all 32 non-contiguous d2d variants | **0 mismatches**, both vendors. |
 | `flake_hunt.py --test fem_implicit` -- 500 iterations, then 300 more with 3 background GPU-load processes | **0 failures**, both vendors. |
 
-So the mechanism is identified but the trigger is not: it needs the full parallel suite
-(~16 test classes across processes sharing one GPU), which is the only context in which
-either failure has ever been seen. Base rate from the archive: **2 failures in 9 recorded
-full-suite runs**. `rocm-tools/slurm/flake_hunt.sbatch` repeats the whole suite N times and
-dumps every failure block, which is the right next step -- a single green run does not
-clear this.
+Every one of those probes was ordering-shaped, and the reproduction says the bug is not
+about ordering -- which is why they were all clean. They also ran far too few copies: at
+roughly one corrupt readback per several thousand, a few hundred iterations was never going
+to see one. `rocm-tools/d2h_integrity.py` fixes both problems: it hammers the readback
+directly, tens of thousands of times, and prints the run/stride structure of any corruption.
 
-**Assessment**: real, low-frequency, and *not* explained away. Do not treat a single green
-suite as proof. Leading candidate, found in the gate audit later the same day:
-**mis-ordered mempool frees** (see the `test_graph.py` section). A free that is not ordered
-after the work still reading the buffer lets a later allocation reuse live memory; the
-severe form is the GPU fault that test produces on MI350X, and the mild form is exactly
-this -- a destination that reads back partly zero, because every async-copy test builds its
-destination by copying `np.zeros` into it, so a stale in-flight write of zeros landing on
-recycled memory produces exactly the observed prefix. Chase that first. Secondary candidate: reuse of Warp's
-per-stream `cached_event` (one event per stream, re-recorded on every
-`wait_stream`/`ScopedStream` entry, and used for exactly this alloc/free ordering) -- legal
-under CUDA's event semantics, worth verifying against HIP's.
+**Assessment**: real, reproduces at roughly **50% per full-suite run**, and it **silently
+corrupts data Warp hands back to the user**. This is now the most serious open item in the
+port: it is not a harness artifact, and any `mjw.step` result read back with `.numpy()` is
+exposed to it. Next steps, in order:
+
+1. Run `d2h_integrity.py` in its three variants (pageable, pageable under GPU load,
+   pinned). If pinned is clean and pageable is not, the bug is in ROCm's pageable-D2H
+   chunking and the workaround is to stage through a pinned buffer on HIP.
+2. If pinned is affected too, narrow by transfer size. The 9-element FEM failure cannot be
+   a chunking artifact at 36 bytes, so it may be a second, unrelated bug.
+3. Either way this is worth filing with AMD: a 4 MB `hipMemcpyAsync` D2H that loses whole
+   2 KB chunks is a showstopper-class runtime bug.
 
 ## Test-gate audit (2026-08-18)
 
