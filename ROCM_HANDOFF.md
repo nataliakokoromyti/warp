@@ -364,15 +364,17 @@ Where `aloha_sdf`'s time actually goes, from mujoco_warp's own event trace
 | scope | MI350X | L40S |
 |---|---|---|
 | `step` | 34.83 ms | -- |
-| `forward.fwd_position.collision.sdf_narrowphase` | **30.25 ms (87% of the step)** | 1.23 ms |
+| `forward` | 32.68 | 16.11 |
+| `forward.fwd_position.collision.sdf_narrowphase` | **30.25 (87% of the step)** | 1.23 |
 | `...collision.convex_narrowphase` | 0.34 | 1.45 |
 | `...collision.primitive_narrowphase` | 0.04 | 0.05 |
 | `...collision.nxn_broadphase` | 0.06 | 0.03 |
 | `forward.solve` | 1.39 | 12.21 |
 
-One kernel, 87% of the step, 24.5x off the L40S. That is the entire `aloha_sdf` gap.
+One kernel, 87% of the step, 24.5x off the L40S. That is the entire `aloha_sdf` gap. It has
+two causes, and the smaller one is the one that looks like the obvious answer.
 
-**Root cause: the kernel had no `__launch_bounds__`.** Without it the HIP compiler must
+**First cause: the kernel had no `__launch_bounds__`.** Without it the HIP compiler must
 assume the maximum flat workgroup size (1024 threads = 16 waves resident on one CU = 4
 waves per SIMD), which caps the kernel at 128 VGPRs. `_sdf_narrowphase` inlines the whole
 gradient-descent / Wolfe line-search / octree-sampling stack into one body and wants far
@@ -513,6 +515,45 @@ on 263.50 / 262.47 / 263.05 / 264.39.
 So the ranked fix list for the one genuinely AMD-hostile collision kernel is: compile out the
 device prints (12.0x), then the static octree index (a further 1.16x), and `__launch_bounds__`
 only matters if the prints stay.
+
+**Validated in the shape it should be upstreamed** (`rocm-tools/slurm/col_sdf_round5.sbatch`).
+The prints are *guarded*, not deleted -- `rocm-tools/sdf_debugprint_patch.py` wraps each in
+`if _SDF_DEBUG_PRINT:` on a module constant, so Warp emits `if (false)` and the branch dies
+in the first simplification pass while `MJW_SDF_DEBUG_PRINT=1` brings the diagnostics back.
+It measures the same as deleting them:
+
+| | isolated kernel, ms | `aloha_sdf` @8192, steps/s |
+|---|---|---|
+| stock (controls) | 235.48 / 236.35 | 44,439 / 49,557 |
+| guarded prints | 22.05 | 74,179 |
+| **guarded prints + static octree index** | **18.74** | **101,266 / 105,751** |
+
+**2.20x end to end**, from 46,998 to 103,509 steps/s. (The 74,179 for guarded-alone is below
+`round4`'s 100,753 / 105,486 for the same change with the prints deleted; the node was
+contended and that single point should not be read as the guard being worse -- at kernel
+level guarded is 22.05 against deleted's 21.96 / 21.90.)
+
+Correctness, checked against a same-horizon control because the scene is chaotic and ROCm
+run-to-run nondeterministic (`rocm-tools/sdf_equiv.py`, 512 worlds, 1 step):
+
+| field | stock vs stock (control) | patched vs stock |
+|---|---|---|
+| `contact.dist` | 1.104892e-02 | 1.104894e-02 |
+| `contact.pos` | 3.560256e-02 | 3.560257e-02 |
+| `contact.frame` | 6.340905e-01 | 6.340907e-01 |
+| `contact.geom` / `nacon` | 0 | 0 |
+| `qpos` | 9.08e-09 | 1.55e-07 |
+| `qvel` | 9.08e-06 | 1.55e-04 |
+
+The contact arrays differ from stock by *the same amount two identical stock runs differ*:
+contacts are appended in nondeterministic order (the `worldid` column permutes by ~500
+either way), so those columns measure ordering, not physics. `nacon` and the geom pairing
+are exact. State drift after one step is 1.6e-7 in `qpos` -- about 17x the run-to-run floor,
+which is what changing register pressure and FMA contraction does to a chaotic contact
+solve, not a semantic change.
+
+Test suites, both green: **Warp 8,294 tests, `OK (skipped=240)`** with the codegen change on
+(`rocm-tools/slurm/col_validate_warp.sbatch`) -- identical to the branch baseline.
 
 Also refuted this round: `rocprofv3 --kernel-trace` is unusable on a captured mujoco_warp
 run -- it hangs on `aloha_sdf` and segfaults with `--output-format csv` (matching the known
