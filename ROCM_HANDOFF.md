@@ -289,35 +289,6 @@ poisons the HIP context and aborts the process).
 same assets and settings. The old handoff item claiming AMD uniquely needs `nconmax~26000`
 was wrong -- this is a mujoco_warp/scene-config issue, not a ROCm accounting difference.
 
-## `primitives` benchmark -- root-caused and fixed (2026-08-18)
-
-`primitives` was the last AMD-only benchmark failure (it runs on an L40S at 1.19M
-steps/s). It is not a physics or rendering problem: mujoco_warp's Newton solver launches
-
-```python
-wp.launch(_update_gradient_init_h_sparse(sc), dim=(d.nworld, m.nv_pad, m.nv_pad), ...)
-```
-
-and `primitives` runs `nworld=8192` with `nv_pad` in the high hundreds --
-`8192 x 768 x 768 = 4,831,838,208` threads, past `UINT32_MAX`. **HSA encodes each
-dispatch dimension's global work size as a uint32**, so `gridDim.x * blockDim.x` cannot
-exceed `2**32`; `wp_cuda_launch_kernel` rejected the launch up front (the guard exists
-because HIP does *not* reject it -- it dispatches and faults with a sticky launch failure
-that poisons the context). CUDA has no such ceiling, which is the entire vendor
-difference. Verified directly: the same launch shape counts correctly on an L40S
-(`rocm-tools/big_launch.py`).
-
-**Fix** (`warp/native/warp.cu`): the blanket `dim > UINT32_MAX` rejection is only correct
-for *lean* kernels, which map one thread per work item. A **grid-stride** kernel (Warp's
-default) loops over the full extent, so the grid size carries no semantics and clamping
-`grid_x` to `UINT32_MAX / block_dim` covers exactly the same work items. The guard now
-clamps for grid-stride launches and only rejects lean ones. This also un-gates
-`test_large.py`'s two `not d.is_hip` tests, which launch 2**33 and ~5.5e11 threads
-through grid-stride kernels.
-
-Tool: `rocm-tools/big_launch.py` (oversized 3D and 1D launches plus a
-context-still-usable check).
-
 Where the remaining gap actually lives, now that allocation noise is gone:
 
 1. **Conditional graph nodes (still AMD-blocked).** The L40S graph has **144 kernel nodes
@@ -363,6 +334,36 @@ wide, while reducing blocks resident per CU. Tool: `rocm-tools/blockdim_tune.py`
 - **Intermittent watch**: two different single-test suite failures across runs
   (`test_copy_i2c_...Graph...`, `test_implicit_fields`) — **superseded**, see "The two
   intermittent suite failures" above for the recovered signatures and the flake hunt.
+
+## `primitives` benchmark -- root-caused and fixed (2026-08-18)
+
+`primitives` was the last AMD-only benchmark failure (it runs on an L40S at 1.19M
+steps/s). It is not a physics or rendering problem: mujoco_warp's Newton solver launches
+
+```python
+wp.launch(_update_gradient_init_h_sparse(sc), dim=(d.nworld, m.nv_pad, m.nv_pad), ...)
+```
+
+and `primitives` runs `nworld=8192` with `nv_pad` in the high hundreds --
+`8192 x 768 x 768 = 4,831,838,208` threads, past `UINT32_MAX`. **HSA encodes each
+dispatch dimension's global work size as a uint32**, so `gridDim.x * blockDim.x` cannot
+exceed `2**32`; `wp_cuda_launch_kernel` rejected the launch up front (the guard exists
+because HIP does *not* reject it -- it dispatches and faults with a sticky launch failure
+that poisons the context). CUDA has no such ceiling, which is the entire vendor
+difference. Verified directly: the same launch shape counts correctly on an L40S
+(`rocm-tools/big_launch.py`).
+
+**Fix** (`warp/native/warp.cu`): the blanket `dim > UINT32_MAX` rejection is only correct
+for *lean* kernels, which map one thread per work item. A **grid-stride** kernel (Warp's
+default) loops over the full extent, so the grid size carries no semantics and clamping
+`grid_x` to `UINT32_MAX / block_dim` covers exactly the same work items. The guard now
+clamps for grid-stride launches and only rejects lean ones. This also un-gates
+`test_large.py`'s two `not d.is_hip` tests, which launch 2**33 and ~5.5e11 threads
+through grid-stride kernels -- and those tests check exact per-work-item counts, so they
+verify the clamped path covers every element.
+
+Tool: `rocm-tools/big_launch.py` (oversized 3D and 1D launches plus a
+context-still-usable check).
 
 ## The two intermittent suite failures -- characterized (2026-08-18)
 
