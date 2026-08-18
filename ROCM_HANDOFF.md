@@ -627,6 +627,11 @@ There is no ROCm CI runner, so validation is a single job rather than a pipeline
 ```bash
 sbatch rocm-tools/slurm/validate.sbatch          # build + both suites + flake watch + benchmarks
 VALIDATE_QUICK=1 sbatch .../validate.sbatch      # skip benchmarks
+
+sbatch rocm-tools/slurm/robust_probes.sbatch     # the whole robustness probe battery
+sbatch rocm-tools/slurm/robust_nv.sbatch         # the same probes on an L40S, as a control
+sbatch rocm-tools/slurm/flake_hunt.sbatch        # N full-suite runs, dumping every failure
+sbatch rocm-tools/slurm/robust_build.sbatch      # build an isolated clone (PATCH=... optional)
 ```
 
 It builds Warp, runs the Warp and mujoco_warp suites, repeats the historically flaky test
