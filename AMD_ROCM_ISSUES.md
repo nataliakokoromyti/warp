@@ -12,13 +12,14 @@ Everything below is reproducible with scripts in `rocm-tools/` of the branch abo
 
 ---
 
-## 0. Correctness bug (highest severity): silent 1-KB-in-8-KB data loss under multi-process load
+## 0. Correctness bug (highest severity): one XCD's workgroups silently produce no output
 
-**Under multi-process contention on one MI350X, a buffer that was initialized by a
-host-to-device copy and then overwritten by a kernel comes back with a regular lattice of
-1 KB blocks still holding the *pre-kernel* values.** No error is reported anywhere: no
-launch error, no sticky error, no HSA exception. A full `hipDeviceSynchronize` plus re-read
-does not repair it -- the wrong bytes are genuinely in device memory.
+**Under multi-process contention on one MI350X, a kernel writing to a `hipMalloc`ed buffer
+can complete "successfully" while exactly one of the eight round-robin XCD classes of
+workgroups leaves no visible output.** No error is reported anywhere: no launch error, no
+sticky error, no HSA exception. A full `hipDeviceSynchronize` plus re-read does not repair
+it -- the wrong bytes are genuinely in device memory. Memory from `hipMallocAsync` is
+immune.
 
 This was found chasing an intermittent Warp test failure and only resolved once the damage
 was described structurally rather than counted. On a 1,000,000-element float32 array written
@@ -73,19 +74,28 @@ all_zero True   repaired_by_reread False
 In SPX mode workgroups are distributed round-robin across the 8 XCDs, so this is exactly
 one XCD's share of the launch producing nothing.
 
-**Two readings, and we would like your help choosing.** At `block_dim = 256` floats, one
-block is exactly 1 KB, which is also the damage granularity -- so these fit equally well:
+**The unit of loss is the thread block.** At `block_dim = 256` floats a block is exactly
+1 KB, which is also the damage granularity, so we varied `block_dim` to rule out a fixed
+byte lattice:
 
-1. **Workgroup loss**: one XCD's workgroups do not run (or their writes are dropped), and
-   the surviving zeros are the untouched scrub values.
-2. **Scrub ordering**: freshly-`hipMalloc`ed VRAM is zeroed by the driver's scrubber, that
-   scrub is still in flight when the kernel writes, and the scrubber's zeros land last,
-   chunked across engines at 1 KB / 8 KB.
+| `block_dim` | run length | run stride | elements lost (of 1,000,000) |
+|---|---|---|---|
+| 64 | **256 B** | **2 KB** | 124,992 |
+| 256 | **1 KB** | **8 KB** | 124,928 / 125,184 |
+| 1024 | **4 KB** | **32 KB** | 124,928 |
 
-We are running `block_dim = 64 / 256 / 1024` to separate them (damage scaling with
-`block_dim` implies reading 1; a fixed 1 KB / 8 KB lattice implies reading 2) and will
-share the result. Either way the allocator dependence is solid: `hipMallocAsync` is immune
-across 29,000+ launches under the same load.
+Run length is exactly `block_dim x 4` bytes and stride exactly `8 x block_dim x 4`, at every
+block size, while the fraction lost stays 1/8 and the missing blocks always share a single
+residue mod 8. A DMA or scrub chunking would have held a fixed byte lattice. **One XCD's
+entire share of the workgroups produces no visible output.**
+
+**Our best reading**, offered as a hypothesis rather than a measurement: a fresh
+`hipMalloc` establishes a new virtual-to-physical mapping, and under multi-process
+contention one XCD's TLB (or L2) is not updated for it, so that XCD's workgroups write
+somewhere stale while the readback sees the correct pages still holding their scrubbed
+zeros. That is consistent with everything we see: pool allocations reuse existing mappings
+and are immune across 29,000+ launches under identical load; the surviving values are always
+exactly `0.0`; and a full device synchronize does not repair them.
 
 **Trigger**: process-level concurrency on a single device. One process is clean over 6,000
 iterations; **eight concurrent processes doing the same work hit it in 2-7 of 8**, at
