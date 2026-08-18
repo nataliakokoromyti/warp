@@ -482,14 +482,18 @@ the side-stream block does not join it back either. At replay the memory can be 
 while those kernels are still reading it, which is the fault. This is a gap in **our HIP
 branch**, not (necessarily) a ROCm bug.
 
-Proposed fix: before issuing the free on the capture stream, join every stream that is part
-of the same capture into it (`cuStreamGetCaptureInfo` to match the capture id, then
-record/wait per stream), reproducing at stream granularity the dependency CUDA gets from
-`alloc_leaf_nodes`. Caveat to check while implementing: if the side stream was already
-destroyed by the time the free runs, it is gone from `g_streams` and the join cannot be
-made -- that case needs the dependency captured at allocation time instead.
+**Fix**: `hipStreamUpdateCaptureDependencies(capture_stream, alloc_leaf_nodes, n,
+hipStreamAddCaptureDependencies)` immediately before the `hipFreeAsync`. Warp already
+computes `alloc_leaf_nodes` via `get_dependent_leaf_nodes(alloc_info.node, ...)` for the
+CUDA path, and already binds `hipStreamUpdateCaptureDependencies`, so the recorded free
+node inherits exactly the dependencies `cudaGraphAddMemFreeNode` would have been given.
+Adding (not setting) keeps the capture stream's own frontier as a dependency. If the
+allocation node was never found (`alloc_info.node == NULL`, already a warned-about case)
+the ordering cannot be reconstructed and the code now says so explicitly.
+
 `rocm-tools/graph_alloc_fault.py` decomposes the test (temp stream vs device stream, with
-and without fills, large vs small) so the fix can be validated against the exact ingredient.
+and without capture-time fills, large vs small) so the fix can be checked against the exact
+ingredient that faults.
 
 Related, and worth checking in the same pass: the deferred/eager free paths order the free
 against the allocating stream using that stream's single reusable `cached_event`
