@@ -373,10 +373,10 @@ D2H copy on the device's null stream and never explicitly synchronizes -- it rel
 CUDA's legacy null-stream ordering plus the documented rule that a D2H copy into *pageable*
 host memory returns only once it has completed.
 
-Reproduced: **2 failures in the first 4 of 14 repeated full-suite runs**
-(`rocm-tools/slurm/flake_hunt.sbatch`), which puts the rate near 50% per suite run --
-far higher than the archive suggested, and high enough that any single green suite is weak
-evidence.
+Reproduced: **3 failing runs (4 failing tests) in 5 repeated full-suite runs**
+(`rocm-tools/slurm/flake_hunt.sbatch`), i.e. a ~60% chance that any given full-suite run
+trips it -- far higher than the archive suggested, and high enough that a single green
+suite is close to no evidence at all.
 
 | run | test | mismatched | first bad index |
 |---|---|---|---|
