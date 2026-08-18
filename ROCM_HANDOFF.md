@@ -552,10 +552,13 @@ are exact. State drift after one step is 1.6e-7 in `qpos` -- about 17x the run-t
 which is what changing register pressure and FMA contraction does to a chaotic contact
 solve, not a semantic change.
 
-Test suite, with the control run in the same job
-(`rocm-tools/slurm/col_validate_warp.sbatch`): the Warp suite is **8,294 tests,
-`OK (skipped=240)`** both with the codegen change on (683 s) and off (696 s) -- identical to
-each other and to the branch baseline.
+Both test suites, each with its control run in the same job: the **Warp suite is 8,294 tests,
+`OK (skipped=240)`** with the codegen change on and off
+(`rocm-tools/slurm/col_validate_warp.sbatch`), and the **mujoco_warp suite is 1,233 passed /
+30 skipped** with the SDF fixes and without (`rocm-tools/slurm/col_validate_mjw.sbatch`) --
+both identical to the branch baseline. (The patched mujoco_warp run took 109 s against the
+stock run's 886 s. That is the JIT-cache warming artifact documented above, *not* a speedup;
+the two runs shared a kernel cache and the second inherited it.)
 
 **Both mujoco_warp fixes are upstream candidates, not ROCm workarounds.** The same patched
 source on an L40S (`rocm-tools/slurm/col_sdf_nv_ab.sbatch`) is slightly *faster*, never
