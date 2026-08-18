@@ -279,7 +279,17 @@ wide, while reducing blocks resident per CU. Tool: `rocm-tools/blockdim_tune.py`
   2026-08-17**: the same overflow reproduces on an NVIDIA L40S with identical assets and
   settings, so it is not an AMD accounting difference. Upstream/scene issue.
 
-## ROCm bugs worth filing with AMD (minimal repros exist in this history)
+## ROCm bugs worth filing with AMD
+
+**See `AMD_ROCM_ISSUES.md`** — a staged, self-contained report with environment, measured
+numbers, repro scripts and root-cause reads (not yet sent to AMD). Summary of what it
+covers, in value order: (1) hipGraph **conditional node** support, worth a measured 4.24x
+on franka / 3.38x on humanoid; (2) graph **allocation nodes replay ~20x worse than CUDA**
+(2.20x vs 1.06x cold/warm penalty); (3) the **stuck invalidated capture** bug, already
+fixed on clr `develop` as `fa77aed` but unreleased — ask for a 7.2.x backport;
+(4) minor CUDA-semantics divergences. Original working notes below.
+
+### Original working notes
 
 1. Blit (fill/copy) and mempool alloc/free graph nodes replay at ~26 µs/node vs
    ~1.7 µs/node for kernel nodes (`rocm-tools/graph_overhead.py`) — the reason all the
