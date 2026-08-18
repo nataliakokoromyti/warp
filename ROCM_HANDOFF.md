@@ -491,13 +491,25 @@ workgroup" looked at first like "one XCD's share of the launch". **That reading 
 device-allocated buffer and is clean over **29,000 launches across 8 concurrent
 processes**. A launch does not simply lose workgroups.
 
-What every failing case *does* have, and the clean probe did not, is a **multi-megabyte
-pageable host-to-device copy immediately before the kernel** -- `wp.array(data=numpy_array)`
-builds every one of these buffers -- and the surviving wrong bytes are exactly the H2D
-source values (zeros). So the live explanation is that **a chunked pageable H2D can complete
-after the kernel the stream ordered behind it**, with the split's interleave granularity
-showing up as the 1 KB / 8 KB lattice. `block_dropout.py --h2d-init` is the discriminating
-experiment: same kernel, but the buffer initialized by an H2D copy instead of a device fill.
+Adding the multi-megabyte pageable **host-to-device copy** that every failing case performs
+before its kernel (`wp.array(data=numpy_array)`) does not reproduce it either:
+`block_dropout.py --h2d-init` is clean over **37,000 launches across 8 concurrent
+processes**. So neither the launch nor a preceding H2D is sufficient on its own.
+
+Bisection state, all under 8-way process concurrency:
+
+| workload | result |
+|---|---|
+| `copy_repro.py` -- the test template's copy | **reproduces**, 5-7 of 8 processes |
+| trivial kernel into a device-allocated buffer | clean, 29,000 launches |
+| trivial kernel into an H2D-initialized buffer | clean, 37,000 launches |
+
+What is left in the failing path and absent from the clean probes: the test template wraps
+every copy in `ScopedMempool(dev, True)` + `ScopedMempool(dev, False)` +
+`ScopedMempoolAccess(dev, dev, True)`, so each iteration **toggles the allocator backend
+between `hipMallocAsync` and `hipMalloc` and re-enables device-to-self mempool access** --
+thousands of times, from eight processes at once. `copy_repro.py --mempool
+{template,on,off,none}` bisects exactly that and is the next result to get.
 
 Whatever the final mechanism, the user-visible statement is already solid and serious:
 **on MI350X under multi-process load, Warp can silently return partly stale data.**
