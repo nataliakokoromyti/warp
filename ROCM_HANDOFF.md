@@ -365,172 +365,24 @@ verify the clamped path covers every element.
 Tool: `rocm-tools/big_launch.py` (oversized 3D and 1D launches plus a
 context-still-usable check).
 
-## The two intermittent suite failures -- characterized (2026-08-18)
+## The two intermittent suite failures -- SOLVED (2026-08-18)
 
-Both were recovered from the archived suite logs, and they are **the same failure mode**,
-not two unrelated flakes: a **torn device-to-host read**. Warp's `array.numpy()` issues its
-D2H copy on the device's null stream and never explicitly synchronizes -- it relies on
-CUDA's legacy null-stream ordering plus the documented rule that a D2H copy into *pageable*
-host memory returns only once it has completed.
+**Answer first: on MI350X under multi-process load, a kernel writing to a `hipMalloc`ed
+buffer can leave exactly one of the eight round-robin XCD classes of workgroups with no
+visible output.** No error is raised, and a full device synchronize does not repair it.
+Memory from `hipMallocAsync` is immune, which is why ordinary Warp and mujoco_warp code --
+`rocm-117` enables memory pools by default -- is **not** exposed. The failing tests are the
+ones that deliberately disable pools to exercise the default allocator.
 
-Reproduced: **3 failing runs (4 failing tests) in 5 repeated full-suite runs**
-(`rocm-tools/slurm/flake_hunt.sbatch`), i.e. a ~60% chance that any given full-suite run
-trips it -- far higher than the archive suggested, and high enough that a single green
-suite is close to no evidence at all.
-
-| run | test | mismatched | first bad index |
-|---|---|---|---|
-| archive `16811062` | `test_copy_i2c_d2d_SrcPoolOn_DstPoolOff_Stream0_NoGrad_**Graph**_AccessDstSrc` | 125,184 / 1,000,000 (12.5%) | 0 |
-| archive `16812542` | `test_implicit_fields` | 3 / 9 | 6 |
-| hunt run 3 | `test_copy_i2c_d2d_SrcPoolOn_DstPoolOff_**NoStream**_NoGrad_**NoGraph**_AccessBoth` | 124,992 / 1,000,000 (12.5%) | 512 |
-| hunt run 4 | `test_copy_i2fi_**d2h**_SrcPoolOff_DstPoolOff_NoStream_NoGrad_NoGraph_AccessNone` | 124,928 / 1,000,000 (12.5%) | 1,280 |
-| hunt run 5 | `test_copy_fi2fi_d2d_SrcPoolOn_DstPoolOff_Stream0_NoGrad_Graph_AccessNone` | 125,184 / 1,000,000 (12.5%) | 256 -- **and the zeros were on the `src.numpy()` side** |
-| hunt run 5 | `test_implicit_fields` (same run, second failure) | 3 / 9 | 6 |
-
-Run 5 is the decisive one. The assertion is `assert_np_equal(dst.numpy(), src.numpy())`,
-and there the zeros were on the **DESIRED** side -- i.e. **`src.numpy()`** came back
-partly zero while `dst` held the correct values. The array being read is not the array the
-test was writing to. Whatever is failing is the **readback**, not the copy under test.
-
-**The reproduction refutes the ordering hypothesis.** The new failures use **no graph and
-no explicit stream** -- there is no cross-stream construct left to mis-order. What survives
-is the shape of the damage: on every 1,000,000-element (4 MB) case, ~12.5% of the buffer is
-zero, and the count is a near-exact multiple of 512 elements (124,992 = 244 x 512;
-124,928 = 244 x 512), starting at a 512-element boundary. That is **whole 2 KB chunks of a
-chunked transfer going missing**, not a partially-completed copy and not a torn read at a
-single boundary. Both failing tests fail inside `assert_np_equal(dst.numpy(), ...)`.
-
-So the suspect is now the **device-to-host readback itself** (`array.numpy()` ->
-`hipMemcpyAsync` D2H into pageable host memory, which ROCm stages in chunks), not stream or
-graph ordering. Note that `copy_template` calls `wp.synchronize_stream()` before the
-assertion, so the producing kernel has already been waited on at the host -- which argues
-the loss is inside the transfer (dropped or stale chunks) rather than a plain race against
-an unfinished kernel. The probe distinguishes the two: after any corrupt readback it
-re-reads with a full device synchronize and reports whether the device buffer was intact. `rocm-tools/d2h_integrity.py` hammers exactly that -- tens of thousands of
-readbacks, printing the run/stride structure of any corruption, with pinned-destination and
-background-load variants to localize it.
-
-**What was tested and did not reproduce it** (all on MI350X, rocm-117; every probe is in
-`rocm-tools/` and each has a clean L40S control):
-
-| probe | result |
-|---|---|
-| `capture_fork_join.py` -- does a captured cross-stream fork/join (the shape `wp.copy()` builds for non-contiguous arrays) actually order? | **PASS**, 20/20. A 27 ms kernel on the forked branch makes `synchronize_stream()` block the full 27 ms, so the join edge is honored. |
-| `null_stream_sync.py` -- 7 shapes of "produce on one stream, read with `.numpy()`, no explicit sync", including graph replay with no sync at all, plus 400 stress iterations each at n = 9 / 1K / 64K / 1M | **0 torn reads** out of 25 trials per shape and 1,600 stress iterations, both vendors. HIP's null-stream ordering and unpinned-D2H blocking both behave like CUDA's. |
-| `copy_repro.py` -- the exact failing copy configuration, 300 iterations, plus all 32 non-contiguous d2d variants | **0 mismatches**, both vendors. |
-| `flake_hunt.py --test fem_implicit` -- 500 iterations, then 300 more with 3 background GPU-load processes | **0 failures**, both vendors. |
-
-Every one of those probes was ordering-shaped, and the reproduction says the bug is not
-about ordering -- which is why they were all clean. They also ran far too few copies: at
-roughly one corrupt readback per couple of thousand, a few hundred iterations was never
-going to see one. `rocm-tools/d2h_integrity.py` fixes both problems -- it hammers the
-readback tens of thousands of times and prints the run/stride structure of any corruption.
-
-It also narrows the trigger, by *not* reproducing:
-
-| d2h_integrity variant | result |
-|---|---|
-| write with a kernel then `.numpy()`, same buffer, 20,000x | **0 corrupt** |
-| same, without rewriting between reads (control) | **0 corrupt** |
-| same, into a **pinned** destination | **0 corrupt** |
-| same, with 2 background GPU-load processes | **0 corrupt** |
-| `--churn 4`: 4 fresh pool buffers allocated, written, read, freed per iteration | **0 / 20,000** |
-| `copy_repro.py` -- the exact failing test configuration | **0 / 6,000** |
-| `copy_repro.py --variants all` -- 32 configurations | **0 / 6,400** |
-
-That is ~110,000 readbacks across every single-process shape we could think of, including
-heavy pool churn and the literal failing configuration, with nothing. Meanwhile the full
-suite trips it in ~60% of runs.
-
-**The missing variable was process-level concurrency, and that reproduces it.** The suite
-runner executes ~16 test classes in *parallel processes* sharing one GPU; every probe above
-is a single process. Running **8 concurrent `copy_repro.py` processes** against one MI350X:
-
-```
-CONCURRENT_K=8   processes_reporting_mismatch = 5/8
-    FAIL indexed2contiguous_OwnStream_Graph: 6/1500 mismatches
-    {'first_mismatch': 256, 'total_mismatch': 125184, ...}   <- every occurrence
-```
-
-So there is now a **standalone reproducer that does not need the test suite**: eight
-concurrent processes doing the failing copy, ~1 in 1,500-10,000 iterations per process.
-
-### What the corruption actually is: **one thread block in every eight writes nothing**
-
-With the reproducer in hand, `copy_repro.py` was extended to report the *structure* of the
-damage. Every occurrence, in every process, has the same shape:
-
-```
-{'dst_bad': 125184, 'src_bad': 0,
- 'dst_structure': {'n': 125184, 'runs': 489, 'run_lengths': [256],
-                   'first_runs': [(256,256),(2304,256),(4352,256),(6400,256)],
-                   'strides': [2048], 'all_zero': True, 'values_seen': [0.0]},
- 'dst_ok_after_sync': False, 'src_ok_after_sync': True}
-```
-
-Read that carefully:
-
-* **489 runs of exactly 256 elements**, at a **stride of exactly 2048 elements**, always
-  zero. Warp launches with 256 threads per block, so 256 elements is *one thread block's
-  output* and 2048 elements is *eight blocks*.
-* So **exactly one thread block in every eight produced no output at all**. That accounts
-  for every count observed anywhere: 489x256 = 125,184; 488x256 = 124,928;
-  488x256+64 = 124,992 (partial final block). The 12.5% is 1/8, exactly.
-* Only the *phase* varies between occurrences (first bad block at 0, 256, 512, 1792,
-  12288 ...), which is why the totals cluster on two or three values.
-* `dst_ok_after_sync: False` -- a full device synchronize and re-read does **not** repair
-  it. The writes never landed; this is not a transfer or readback problem at all.
-* It lands on whichever array a kernel most recently wrote (`dst_bad` in some hits,
-  `src_bad` in others), and it happens with and without graph capture, on the device stream
-  and on a user stream.
-
-In bytes that is **1 KB missing out of every 8 KB**. MI350X is an 8-XCD part (CDNA4, and
-this machine runs Compute Partition **SPX** / Memory Partition **NPS1**), so "every 8th
-workgroup" looked at first like "one XCD's share of the launch". **That reading is wrong**:
-`rocm-tools/block_dropout.py` launches a trivial `a[tid] = 1.0` kernel into a
-device-allocated buffer and is clean over **29,000 launches across 8 concurrent
-processes**. A launch does not simply lose workgroups.
-
-Adding the multi-megabyte pageable **host-to-device copy** that every failing case performs
-before its kernel (`wp.array(data=numpy_array)`) does not reproduce it either:
-`block_dropout.py --h2d-init` is clean over **37,000 launches across 8 concurrent
-processes**. So neither the launch nor a preceding H2D is sufficient on its own.
-
-### Resolved: it happens only when the memory pool is **disabled**
-
-The remaining difference was the memory-pool scoping the test template wraps every copy in.
-`copy_repro.py --mempool {template,on,off,none}`, 8 concurrent processes x 1,500 iterations
-each:
-
-| memory pool during the copy | processes hitting corruption |
-|---|---|
-| `template` (`ScopedMempool(True)` then `(False)` -- collapses to **disabled**) | 1 / 8 |
-| `off` -- explicitly **disabled** (`hipMalloc`) | **2 / 8** (one process 7 hits in 1,500) |
-| `on` -- **enabled** (`hipMallocAsync`) | **0 / 8** |
-| `none` -- no scoping, Warp's default, which is **enabled** | **0 / 8** |
-
-**The corruption appears if and only if the allocation came from `hipMalloc` rather than
-the stream-ordered pool.** That fits every observation: the leftover values are always
-exactly `0.0`, in a regular 1 KB-per-8 KB lattice, present in device memory after a full
-synchronize. Freshly-`hipMalloc`ed VRAM is **zeroed by the driver's scrubber** before being
-handed out; a scrub that is still in flight, chunked across engines, landing *after* the
-new owner's kernel has written, produces precisely this. Pool allocations reuse memory
-without a fresh scrub, so they are unaffected -- and the contention dependence follows too,
-since a busy device delays the scrub.
-
-**What this means for users**: Warp on `rocm-117` enables memory pools by default (that is
-one of the port's fixes), so ordinary Warp and mujoco_warp code is **not** exposed. The
-failing tests are the ones that deliberately turn pools off to exercise the default
-allocator. Do not disable memory pools on MI350X (`wp.ScopedMempool(device, False)`,
-`WARP_MEMPOOL`-style overrides) on a shared device.
+Filed as issue 0 in `AMD_ROCM_ISSUES.md`. **Do not disable memory pools on a shared
+MI350X.**
 
 ### Minimal reproduction
 
-`rocm-tools/block_dropout.py --no-mempool`, eight concurrent processes: allocate ~4 MB with
-`hipMalloc`, launch a kernel writing `1.0` to every element, `hipDeviceSynchronize`, read
-back, look for zeros. **3 of 8 processes hit it** (once each in 4,000 iterations); the same
-run with pools enabled is 0 of 8. No copies, no graphs, no streams, no host-to-device
-transfer -- just allocate, write, read.
+`rocm-tools/block_dropout.py --no-mempool`, eight concurrent processes: `hipMalloc` ~4 MB,
+launch a kernel writing `1.0` to every element, synchronize, read back, look for zeros.
+No copies, no graphs, no streams, no host transfers. **3 of 8 processes hit it**, about
+once per 4,000 iterations each; with pools enabled, 0 of 8.
 
 ```
 DROPPED iter 474: {'bad_elems': 124992, 'bad_blocks': 489, 'total_blocks': 3907,
@@ -539,52 +391,80 @@ DROPPED iter 474: {'bad_elems': 124992, 'bad_blocks': 489, 'total_blocks': 3907,
                    'all_zero': True, 'repaired_by_reread': False}
 ```
 
-**Every missing block shares one residue mod 8** (2 here; 1, 4, 5 and 7 in other
-occurrences) -- blocks 2, 10, 18, 26, ... In SPX mode workgroups round-robin across the 8
-XCDs, so this is exactly "one XCD's entire share of the launch".
+Every missing block shares **one residue mod 8** (2 here; 1, 4, 5 and 7 in other hits).
+In SPX mode workgroups round-robin across the 8 XCDs, so that is one XCD's entire share.
 
-### Confirmed: the damage tracks thread blocks, not bytes
+### The two measurements that pin it down
 
-At 256 floats per block, one block is exactly 1 KB, which is also the damage granularity --
-so "one thread block in eight" and "a fixed 1 KB / 8 KB byte lattice" were indistinguishable.
-Varying `block_dim` separates them, and the answer is unambiguous:
+**1. The allocator decides.** Same workload, 8 concurrent processes x 1,500 iterations,
+only the allocation path changed (`copy_repro.py --mempool ...`):
 
-| `block_dim` | run length | run stride | elements lost (of 1,000,000) | residues mod 8 |
-|---|---|---|---|---|
-| 64 | **256 B** | **2 KB** | 124,992 | single value |
-| 256 | **1 KB** | **8 KB** | 124,928 / 125,184 | single value |
-| 1024 | **4 KB** | **32 KB** | 124,928 | single value |
+| memory pool during the copy | processes hitting corruption |
+|---|---|
+| `off` -- `hipMalloc` | **2 / 8** (one process 7 hits in 1,500) |
+| `template` -- what the test does, which collapses to disabled | 1 / 8 |
+| `on` -- `hipMallocAsync` | **0 / 8** |
+| `none` -- no scoping, Warp's default, pools enabled | **0 / 8** |
 
-Run length is exactly `block_dim x 4` bytes and the stride is exactly `8 x block_dim x 4`,
-at every block size, while the *fraction* lost stays 1/8. **The unit of loss is the thread
-block, and exactly one of the eight round-robin XCD classes is lost.** A DMA or scrub
-chunking bug would have kept a fixed byte lattice; it does not.
+**2. The unit of loss is the thread block, not a byte range.** At 256 floats per block one
+block is exactly 1 KB, which is also the damage granularity, so those two readings were
+indistinguishable. Varying `block_dim` separates them:
+
+| `block_dim` | run length | run stride | elements lost (of 1,000,000) |
+|---|---|---|---|
+| 64 | **256 B** | **2 KB** | 124,992 |
+| 256 | **1 KB** | **8 KB** | 124,928 / 125,184 |
+| 1024 | **4 KB** | **32 KB** | 124,928 |
+
+Run length is exactly `block_dim x 4` and stride exactly `8 x block_dim x 4` at every block
+size, while the fraction lost stays 1/8. A DMA or scrub chunking bug would have held a fixed
+byte lattice.
 
 **Most likely mechanism** (a reading, not a measurement): a fresh `hipMalloc` establishes a
-new virtual-to-physical mapping, and under multi-process contention one XCD's TLB/L2 is not
-updated for it, so that XCD's workgroups write somewhere stale while the readback sees the
-correct pages holding their scrubbed zeros. That would explain why pool allocations, which
-reuse existing mappings, are immune; why the values are always exactly `0.0`; and why a full
-device synchronize does not repair it.
+new virtual-to-physical mapping and, under contention, one XCD's TLB/L2 is not updated for
+it -- so that XCD's workgroups write somewhere stale while the readback sees the correct
+pages still holding their scrubbed zeros. Consistent with pool allocations being immune
+(they reuse existing mappings), with the surviving values always being exactly `0.0`, and
+with a device synchronize not helping.
 
-**What to hand AMD**: written up as issue 0 in `AMD_ROCM_ISSUES.md`, with the minimal
-repro above.
+### How the failures presented, and the trail
 
-Whatever the final mechanism, the user-visible statement is already solid and serious:
-**on MI350X under multi-process load, Warp can silently return partly stale data.**
+Recovered from the archived suite logs and from repeated suite runs. **3 failing runs
+(4 failing tests) in 5 full-suite runs** (`rocm-tools/slurm/flake_hunt.sbatch`) -- roughly a
+60% chance per run, so a single green suite is close to no evidence.
 
-**Assessment**: real, reproduces at roughly **50% per full-suite run**, and it **silently
-corrupts data Warp hands back to the user**. This is now the most serious open item in the
-port: it is not a harness artifact, and any `mjw.step` result read back with `.numpy()` is
-exposed to it. Next steps, in order:
+| run | test | mismatched |
+|---|---|---|
+| archive `16811062` | `test_copy_i2c_d2d_...Stream0_NoGrad_Graph_AccessDstSrc` | 125,184 / 1,000,000 |
+| archive `16812542` | `test_implicit_fields` | 3 / 9 |
+| hunt run 3 | `test_copy_i2c_d2d_...NoStream_NoGrad_NoGraph_AccessBoth` | 124,992 / 1,000,000 |
+| hunt run 4 | `test_copy_i2fi_d2h_...NoStream_NoGrad_NoGraph_AccessNone` | 124,928 / 1,000,000 |
+| hunt run 5 | `test_copy_fi2fi_d2d_...Stream0_NoGrad_Graph_AccessNone` | 125,184 / 1,000,000, zeros on the **`src`** side |
+| hunt run 5 | `test_implicit_fields` (second failure, same run) | 3 / 9 |
 
-1. Run `d2h_integrity.py` in its three variants (pageable, pageable under GPU load,
-   pinned). If pinned is clean and pageable is not, the bug is in ROCm's pageable-D2H
-   chunking and the workaround is to stage through a pinned buffer on HIP.
-2. If pinned is affected too, narrow by transfer size. The 9-element FEM failure cannot be
-   a chunking artifact at 36 bytes, so it may be a second, unrelated bug.
-3. Either way this is worth filing with AMD: a 4 MB `hipMemcpyAsync` D2H that loses whole
-   2 KB chunks is a showstopper-class runtime bug.
+Two observations turned the investigation. Run 5's zeros were on `src.numpy()`, not on the
+array the test was writing -- so the damage follows whichever buffer a kernel last wrote,
+not the operation under test. And runs 3 and 4 used **no graph and no explicit stream**,
+which removed every cross-stream construct that could be mis-ordered.
+
+**Everything ordering-shaped was tested and is clean** -- all on MI350X with matching L40S
+controls: captured cross-stream fork/join ordering (`capture_fork_join.py`, 20/20, a 27 ms
+forked kernel blocks `synchronize_stream` for the full 27 ms); null-stream implicit ordering
+across 7 shapes including unsynchronized graph replay (`null_stream_sync.py`, 0 torn reads
+in 25 trials per shape plus 1,600 stress iterations); and the literal failing configuration
+plus all 32 copy variants (`copy_repro.py`, 0 in 6,000 and 0 in 6,400).
+
+**Single-process probes never reproduce it**, no matter the shape: ~110,000 readbacks
+across static buffers, pinned destinations, background GPU load, and 20,000 iterations of
+fresh-pool-buffer churn. The missing variable was **process-level concurrency** -- the suite
+runner puts ~16 test classes in parallel processes on one GPU. Eight concurrent
+`copy_repro.py` processes reproduce it in 5-7 of 8, which is what turned a suite-only flake
+into a 30-second standalone repro.
+
+Lesson worth keeping: the first four probes were all clean because they tested the wrong
+axis *and* ran three orders of magnitude too few iterations. Describing the damage
+structurally (runs, stride, residues) rather than counting mismatched elements is what
+actually broke it open.
 
 ## Test-gate audit (2026-08-18)
 
