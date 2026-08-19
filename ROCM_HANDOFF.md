@@ -517,11 +517,8 @@ the results. Its own comment states the hazard it exists to catch:
 > then reuse the memory while it is still used on this stream, leading to data corruption.
 
 On MI350X it does not merely corrupt -- it faults the GPU. **This is a real bug the gate
-was hiding, and it is the strongest lead for the two intermittents**: a mis-ordered
-mempool free hands a still-live buffer to a later allocation, and the milder form of that
-is precisely "the buffer reads back partly zero" (every async-copy test initializes its
-destination by copying `np.zeros` into it, so a stale in-flight write of zeros landing on
-recycled memory produces the observed zero prefix).
+was hiding**, and it is independent of the workgroup-loss bug above: that one needs
+`hipMalloc` plus multi-process contention, this one is a single-process capture fault.
 
 **Decomposed** with `rocm-tools/graph_alloc_fault.py` (one process per case, since a fault
 kills the process). Each case begins a capture and allocates inside it:

@@ -9,18 +9,17 @@ stream and relies on CUDA's legacy null-stream semantics for ordering::
 Legacy semantics say work on the NULL stream is implicitly ordered after all
 pending work on every *blocking* stream of the device (Warp creates its streams
 with ``CU_STREAM_DEFAULT``, i.e. blocking).  There is no explicit synchronize
-anywhere on this path.
-
-If that implicit ordering is not honored, ``.numpy()`` races the producing
-kernel and returns a torn read.  Because a D2H DMA walks the buffer front to
-back, a reader that starts too early yields a **zero prefix with a correct
-suffix**; a small buffer copied instantly instead yields a **correct prefix
-with a zero suffix**.  Both signatures were observed in the Warp suite on
-MI350X (12.5% zero prefix in an async-copy test; 3 zeros of 9 in an FEM test).
+anywhere on that path, so this checks whether HIP honors the ordering.
 
 Each case writes a nonzero value into a zeroed array with a deliberately slow
 kernel and then reads it back with no explicit synchronization.  Any nonzero
 count means the implicit ordering was violated.
+
+Result on MI350X: **clean** in every shape, including graph replay with no sync
+at all -- HIP's null-stream ordering and its blocking behavior for unpinned D2H
+both match CUDA's.  This probe was written to explain the intermittent suite
+failures; it successfully ruled ordering out.  The actual cause turned out to be
+lost thread blocks on ``hipMalloc``ed memory -- see ``block_dropout.py``.
 """
 
 import argparse
@@ -106,9 +105,7 @@ def case_control(device, a, spin):
 def stress(device, sizes, spin, iters):
     """Hammer the plain launch-then-.numpy() pattern across buffer sizes.
 
-    The FEM failure was a 9-element read (correct prefix, zero suffix) and the
-    async-copy failure a 1M-element read (zero prefix, correct suffix), so the
-    race may only open at particular transfer sizes.
+    Sweeps transfer sizes in case a race only opens at particular ones.
     """
     print(f"\nstress: {iters} iterations per size, spin={spin}", flush=True)
     bad_total = 0
