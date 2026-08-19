@@ -1,26 +1,20 @@
 """Hammer device-to-host readback and characterize any corruption.
 
-The two intermittent Warp suite failures on MI350X are both a ``.numpy()`` that
-came back with part of the buffer zeroed, at a rate around one in several
-thousand copies -- far too rare for a few hundred iterations to find, which is
-why the earlier ordering probes came back clean.
+Written while chasing the intermittent Warp suite failures on MI350X, when the
+suspect was still the readback itself.  It is **clean**: ~110,000 readbacks
+across static buffers, rewritten buffers, pinned destinations, background GPU
+load and heavy memory-pool churn, with no corruption at all.  That negative is
+what ruled the transfer out.
 
-Observed in the archived and reproduced failures, all on 1,000,000-element
-(4 MB) float32 arrays:
-
-    124,992 / 1,000,000 mismatched, first at index 512
-    124,928 / 1,000,000 mismatched, first at index 1280
-    125,184 / 1,000,000 mismatched, first at index 0
-
-Each count is ~244 x 512 elements, i.e. ~244 blocks of 2 KB, which looks like
-whole chunks of a chunked transfer going missing rather than a partially
-completed one. This script does many readbacks of a known pattern and, on any
-mismatch, prints the *structure* of the corruption: the runs of bad indices,
-their lengths, and the stride between them.
+The real cause was lost thread blocks on ``hipMalloc``ed memory under
+multi-process contention -- see ``block_dropout.py``.  Keep this around as the
+control: if a future readback bug is suspected, this is the probe that says
+whether the transfer is at fault.
 
     python d2h_integrity.py --iters 20000
-    python d2h_integrity.py --iters 20000 --pinned    # pinned destination
-    python d2h_integrity.py --iters 20000 --load 3    # with background GPU load
+    python d2h_integrity.py --iters 20000 --pinned      # pinned destination
+    python d2h_integrity.py --iters 20000 --churn 4     # fresh pool buffers
+    python d2h_integrity.py --iters 20000 --load 3      # background GPU load
 """
 
 import argparse
