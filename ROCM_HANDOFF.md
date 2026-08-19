@@ -29,6 +29,8 @@ HIP graph-capture PR #15 + our fixes; fully validated but frozen. Full backgroun
 - **Full benchmark suite re-run on 1.17 with warm capture** (2026-08-17): g1_flat 1.51M
   steps/s, franka 5.08M, humanoid 1.40M — see the cross-vendor section for the full table
   and for why the previously reported gaps were mostly a cold-capture artifact.
+- **Every benchmark scene now runs** (2026-08-18): `primitives`, the last AMD-only failure,
+  was an oversized launch and is fixed — 313,893 steps/s.
 
 ## Our fixes (each upstreamable; see git log)
 
@@ -509,7 +511,7 @@ below. Read the numbers as a lower bound.
 | `cuda/test_ipc.py` | 2 | gate is correct, reason was not -- see below |
 | `test_bf16.py` | 1 | needs two devices |
 
-### `test_graph.py`: the gate hides a GPU memory fault (2026-08-18)
+### `test_graph.py`: the gate was hiding a GPU memory fault -- now fixed (2026-08-18)
 
 The exclusion reads *"HIP/ROCm does not support native CUDA graph capture"*. It was
 inherited from AMD's base, where capture was disabled; `rocm-117` enables capture, so the
