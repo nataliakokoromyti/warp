@@ -724,7 +724,8 @@ cost vs node count), `graph_census.py` (node-type census of a captured step grap
 `alloc_trace.py` (which allocations fire during capture, with call sites), `g1_msgraph.py`
 (single- vs multi-stream capture on G1@256; needs `hipgraph_ms.py` fetched from
 zhihuidu-amd/hipgraph-ms), `sort_check.py` (segmented sort correctness), `flex_check.py`
-(cloth physics vs CPU reference); and from the robustness pass: `big_launch.py`
+(cloth physics vs CPU reference); and from the robustness pass: **`block_dropout.py`**
+(the reproducer for the MI350X dropped-workgroup corruption), `big_launch.py`
 (oversized launches past HSA's uint32 ceiling), `null_stream_sync.py` (torn `.numpy()`
 reads), `capture_fork_join.py` (captured cross-stream join ordering), `copy_repro.py`
 (the exact intermittent async-copy configuration), `flake_hunt.py` (repeat one test with
