@@ -53,6 +53,13 @@ stream-priority timing) and FP-tolerance relaxations in the gfx950 style AMD est
 Obsolete on 1.17: the `grid_stride` shim (native ≥1.15) and the rocWMMA `block_dim != 64`
 fallback (the new base has no rocWMMA path at all).
 
+Added 2026-08-18 (robustness pass, all in `warp.cu`): **clamp oversized grid-stride
+launches** instead of rejecting them, so a launch past HSA's uint32 per-dimension ceiling
+runs (this is what makes `primitives` work -- see below); **order in-capture frees after
+every use of the allocation**, which removes a GPU memory fault when an allocation is used
+on a side stream inside a capture; and **report the recorded free node on HIP** so the graph
+topology tests can run at all.
+
 mujoco_warp (`patches/mujoco_warp-rocm-compat.patch`): texture-less rendering auto-disable;
 `graph_conditional` gated on `wp.is_conditional_graph_supported()`; HIP-aware toolkit check;
 **deterministic island slot assignment** (replaces scheduling-order-dependent atomic ranks —
