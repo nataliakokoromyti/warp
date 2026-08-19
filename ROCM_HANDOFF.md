@@ -489,7 +489,7 @@ below. Read the numbers as a lower bound.
 | `cuda/test_cluster_dim.py` | 8 | genuine (no thread block clusters) |
 | `cuda/test_clang_cuda.py` | 7 | genuine (emits PTX/CUDA that cannot load on gfx) |
 | `cuda/test_streams.py` | 3 | 2 genuine HIP limitations (in-graph event timing, external event nodes), 1 timing-flaky (stream priority) |
-| `test_large.py` | 2 | **fixed** -- see the `primitives` section; the grid-stride clamp lets both run |
+| `test_large.py` | 2 | **gate removed** -- the grid-stride clamp lets both run; 17/17 pass on HIP |
 | `test_fast_math.py` | 2 | genuine (fast-math `powf(-2,2)` divergence, PTX inspection) |
 | `cuda/test_ipc.py` | 2 | gate is correct, reason was not -- see below |
 | `test_bf16.py` | 1 | needs two devices |
