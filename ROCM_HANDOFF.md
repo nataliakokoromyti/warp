@@ -368,6 +368,14 @@ verify the clamped path covers every element.
 Tool: `rocm-tools/big_launch.py` (oversized 3D and 1D launches plus a
 context-still-usable check).
 
+**Validated** against a build with the fix (`rocm-tools/slurm/robust_build.sbatch`):
+`big_launch.py` counts the 4.83e9-thread 3D launch and a 2**32+12,345 1D launch exactly and
+leaves the context usable; un-gated `test_large.py` passes **17/17** on HIP; and
+**`primitives` now runs on MI350X at 313,893 steps/s** (L40S 1.19M). A full Warp suite run
+on the same build shows no regressions -- 8,294 tests with three failures, one being the
+MI350X corruption bug documented above and two being a missing `Pillow` in the isolated
+build venv.
+
 ## The two intermittent suite failures -- SOLVED (2026-08-18)
 
 **Answer first: on MI350X under multi-process load, a kernel writing to a `hipMalloc`ed
