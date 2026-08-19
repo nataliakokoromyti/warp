@@ -1,28 +1,32 @@
 """Detect kernel launches that silently drop whole thread blocks on MI350X.
 
-Characterizing the intermittent Warp suite failures produced this, every time,
-on a 1,000,000-element float32 array written by a 256-thread-per-block kernel:
+**This is the reproducer for the MI350X data-corruption bug.** Under
+multi-process contention, a kernel writing to a ``hipMalloc``ed buffer can
+complete with no error while exactly one of the eight round-robin XCD classes of
+workgroups leaves no visible output. A full device synchronize does not repair
+it. ``hipMallocAsync`` (Warp's default memory pool) is immune.
 
-    489 runs of exactly 256 bad elements, stride 2048 elements, all zero
+    # reproduces: 3 of 8 processes, roughly once per 4,000 iterations each
+    for i in $(seq 8); do python block_dropout.py --iters 4000 --no-mempool & done; wait
 
-256 elements is exactly one thread block's output and 2048 elements is eight
-blocks, so **one thread block in every eight wrote nothing**. MI350X (gfx950,
-CDNA4) is an 8-XCD part and distributes workgroups round-robin across XCDs, so
-"every 8th block" is "one XCD's share". A full device synchronize and re-read
-does not repair it, so the writes never landed.
+    # control: same thing with the memory pool enabled -- 0 of 8
+    for i in $(seq 8); do python block_dropout.py --iters 4000 & done; wait
 
-A trivial kernel writing into a device-allocated (``wp.zeros``) buffer does
-**not** reproduce it: 0 in 29,000 launches across 8 concurrent processes. What
-every failing case does instead is initialize the buffer with a **host-to-device
-copy of a multi-MB numpy array** and then run the kernel over it. ``--h2d-init``
-switches to that, which is the discriminating experiment: if the leftover 1 KB
-blocks hold the *h2d* values rather than the kernel's, then part of a chunked
-H2D transfer is landing after the kernel that was supposed to follow it.
+A representative occurrence on a 1,000,000-element float32 array, 256 threads
+per block::
 
-Only reproduces under multi-process contention -- run several copies
-concurrently against one GPU::
+    bad_elems 124992   bad_blocks 489 of 3907   whole_blocks_missing True
+    block_residues_mod8 [2]   first_blocks [2, 10, 18, 26, 34, 42]
+    all_zero True   repaired_by_reread False
 
-    for i in $(seq 8); do python block_dropout.py --iters 3000 --h2d-init & done; wait
+Every missing block shares one residue mod 8, and ``--block-dim`` shows the unit
+of loss is the thread block rather than a fixed byte lattice: run length is
+always ``block_dim * 4`` bytes and the stride ``8 * block_dim * 4``, at 64, 256
+and 1024 threads per block, while the fraction lost stays 1/8.
+
+``--h2d-init`` initializes the buffer with a host-to-device copy instead of a
+device fill; it is clean (0 in 37,000 launches), which is how host-to-device
+ordering was ruled out.
 """
 
 import argparse
