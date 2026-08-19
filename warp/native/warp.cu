@@ -1136,6 +1136,22 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
                     );
                 }
                 check_cuda(cudaFreeAsync(ptr, capture->stream));
+
+                // Report the recorded free node. Capture makes it the capture stream's
+                // sole frontier, so read it back from there -- the CUDA path below gets
+                // the handle directly from cudaGraphAddMemFreeNode, and the graph
+                // topology tests need it on both backends.
+                if (dbg_node_ret) {
+                    CUstreamCaptureStatus post_status = CU_STREAM_CAPTURE_STATUS_NONE;
+                    const cudaGraphNode_t* post_deps = NULL;
+                    size_t post_dep_count = 0;
+                    if (check_cu(cuStreamGetCaptureInfo_f(
+                            capture->stream, &post_status, NULL, NULL, &post_deps, &post_dep_count
+                        ))
+                        && post_status == CU_STREAM_CAPTURE_STATUS_ACTIVE && post_dep_count == 1) {
+                        *dbg_node_ret = post_deps[0];
+                    }
+                }
             }
 #else
             CaptureInfo* capture = capture_iter->second;
