@@ -1,0 +1,883 @@
+diff --git a/mujoco_warp/__init__.py b/mujoco_warp/__init__.py
+index f43ba86..9dc377e 100644
+--- a/mujoco_warp/__init__.py
++++ b/mujoco_warp/__init__.py
+@@ -91,6 +91,7 @@ from mujoco_warp._src.smooth import subtree_vel as subtree_vel
+ from mujoco_warp._src.smooth import tendon as tendon
+ from mujoco_warp._src.smooth import transmission as transmission
+ from mujoco_warp._src.solver import solve as solve
++from mujoco_warp._src.stepper import Stepper as Stepper
+ from mujoco_warp._src.support import contact_force as contact_force
+ from mujoco_warp._src.support import get_state as get_state
+ from mujoco_warp._src.support import jac as jac
+diff --git a/mujoco_warp/_src/cli.py b/mujoco_warp/_src/cli.py
+index ae1532f..372fbc7 100644
+--- a/mujoco_warp/_src/cli.py
++++ b/mujoco_warp/_src/cli.py
+@@ -15,6 +15,7 @@
+ 
+ """Shared utilities and flags for MJWarp CLI tools."""
+ 
++import functools
+ import time
+ from typing import Callable, Tuple, get_type_hints
+ 
+@@ -43,6 +44,12 @@ EVENT_TRACE = flags.DEFINE_bool("event_trace", False, "print an event trace repo
+ NOISE_STD = flags.DEFINE_float("noise_std", 0.01, "add noise to ctrl signal (standard deviation)")
+ NOISE_RATE = flags.DEFINE_float("noise_rate", 0.1, "add noise to ctrl signal (noise rate)")
+ NVMAX = flags.DEFINE_integer("nvmax", None, "maximum active DOFs per world")
++CHUNKED_SOLVER = flags.DEFINE_bool(
++  "chunked_solver",
++  True,
++  "drive the solver loop from the host so it stops at convergence on platforms without "
++  "conditional graph nodes (no effect where they are supported)",
++)
+ 
+ 
+ INIT_ASLEEP = flags.DEFINE_bool(
+@@ -219,8 +226,20 @@ def unroll(
+       for _ in range(3):
+         fn(*(m, d) if rc is None else (m, d, rc))
+       wp.synchronize_device()
+-      with wp.ScopedCapture() as capture:
+-        fn(*(m, d) if rc is None else (m, d, rc))
++      if rc is None and fn in (mjw.step, mjw.forward, mjw.step2) and CHUNKED_SOLVER.value:
++        # Stepper falls back to a single captured graph wherever the split does not
++        # apply, so this is never worse than capturing fn directly.
++        stepper = mjw.Stepper(m, d, warmup=0, fn=fn)
++        launch = stepper.step
++        if stepper.split:
++          print(f"chunked solver: host-driven solver loop, budget {stepper.iterations} iterations")
++        else:
++          print(f"chunked solver: not used ({stepper.reason})")
++      else:
++        stepper = None
++        with wp.ScopedCapture() as capture:
++          fn(*(m, d) if rc is None else (m, d, rc))
++        launch = functools.partial(wp.capture_launch, capture.graph)
+       jit_end = time.perf_counter()
+ 
+       for i in range(NSTEP.value):
+@@ -245,7 +264,7 @@ def unroll(
+             wp.synchronize()
+ 
+           run_beg = time.perf_counter()
+-          wp.capture_launch(capture.graph)
++          launch()
+           wp.synchronize()
+           run_end = time.perf_counter()
+ 
+diff --git a/mujoco_warp/_src/solver.py b/mujoco_warp/_src/solver.py
+index 4aec496..75bfdf4 100644
+--- a/mujoco_warp/_src/solver.py
++++ b/mujoco_warp/_src/solver.py
+@@ -32,7 +32,9 @@ from mujoco_warp._src.types import InverseContext
+ from mujoco_warp._src.types import SolverContext
+ from mujoco_warp._src.warp_util import cache_kernel
+ from mujoco_warp._src.warp_util import event_scope
++from mujoco_warp._src.warp_util import scratch_empty
+ from mujoco_warp._src.warp_util import scratch_full
++from mujoco_warp._src.warp_util import share_scratch
+ 
+ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
+ 
+@@ -3694,7 +3696,10 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
+ 
+   # Build diagonal preconditioner (once per step).
+   if m.is_sparse and m.nflex > 0:
+-    ctx.diag_precond = wp.empty(shape=(d.nworld, m.nv), dtype=float)
++    # Cached on Data: allocating here would put a memAlloc node in a captured step
++    # graph, and the buffer is read by every solver iteration, so under a host-driven
++    # solver loop it also has to outlive the graph that builds it.
++    ctx.diag_precond = scratch_empty(d, f"solver.diag_precond{'_compact' if compact else ''}", (d.nworld, m.nv), float)
+     wp.launch(
+       _diag_precond_build,
+       dim=(d.nworld, m.nv),
+@@ -3731,18 +3736,25 @@ def solve(m: types.Model, d: types.Data):
+     _solve(m, d, ctx)
+ 
+ 
+-def _cached_solver_context(m: types.Model, d: types.Data) -> SolverContext:
++def _cached_solver_context(m: types.Model, d: types.Data, owner=None, slot: str = "_solver_ctx_cache") -> SolverContext:
+   """Reuse the solver context across solves on the same Data.
+ 
+   Allocating the context on every solve puts memAlloc/memFree nodes into
+   captured graphs. Buffers that _create_solver_context allocates with zeros
+   are re-zeroed on reuse; the rest are workspace and need no initialization.
++
++  ``owner`` is where the cache is stored; it defaults to ``d``. The compact
++  solve runs on a ``dataclasses.replace`` copy of ``d`` that is rebuilt every
++  step, so it passes the real Data as ``owner`` (and its own ``slot``) to keep
++  the cache alive across steps.
+   """
++  if owner is None:
++    owner = d
+   key = (m.nv, m.nv_pad, d.njmax, int(m.opt.solver), _use_incremental(m))
+-  cached = getattr(d, "_solver_ctx_cache", None)
++  cached = getattr(owner, slot, None)
+   if cached is None or cached[0] != key:
+     ctx = _create_solver_context(m, d)
+-    d._solver_ctx_cache = (key, ctx)
++    setattr(owner, slot, (key, ctx))
+     return ctx
+   ctx = cached[1]
+   ctx.grad.zero_()
+@@ -3750,6 +3762,54 @@ def _cached_solver_context(m: types.Model, d: types.Data) -> SolverContext:
+   return ctx
+ 
+ 
++# Optional override for how the solver's iteration loop is emitted, installed by
++# mujoco_warp.Stepper while it records a step (see stepper.py). It lets the loop be
++# captured into its own graph and driven from the host, which is how platforms without
++# conditional graph nodes get the same early exit at convergence. ``None`` selects the
++# default: a conditional graph loop where supported, a fully unrolled fixed-budget loop
++# otherwise.
++_iteration_driver = None
++
++
++def _run_solver_iterations(
++  m: types.Model,
++  d: types.Data,
++  ctx: SolverContext,
++  nsolving: wp.array[int],
++  compact: bool = False,
++):
++  """Run the solver's iteration loop, honoring an installed iteration driver."""
++  if _iteration_driver is not None:
++    _iteration_driver(m, d, ctx, nsolving, compact=compact)
++    return
++  emit_solver_iterations(m, d, ctx, nsolving, compact=compact)
++
++
++def emit_solver_iterations(
++  m: types.Model,
++  d: types.Data,
++  ctx: SolverContext,
++  nsolving: wp.array[int],
++  compact: bool = False,
++):
++  """Emit the solver's iteration loop the default way, ignoring any iteration driver."""
++  if m.opt.iterations != 0 and m.opt.graph_conditional:
++    # Note: the iteration kernel (indicated by while_body) is repeatedly launched
++    # as long as condition_iteration is not zero.
++    # condition_iteration is a warp array of size 1 and type int, it counts the number
++    # of worlds that are not converged, it becomes 0 when all worlds are converged.
++    # When the number of iterations reaches m.opt.iterations, solver_niter
++    # becomes zero and all worlds are marked as converged to avoid an infinite loop.
++    # note: we only launch the iteration kernel if everything is not done
++    wp.capture_while(nsolving, while_body=_solver_iteration, m=m, d=d, ctx=ctx, nsolving=nsolving, compact=compact)
++  else:
++    # This branch is mostly for when JAX is used as it is currently not compatible
++    # with CUDA graph conditional.
++    # It should be removed when JAX becomes compatible.
++    for _ in range(m.opt.iterations):
++      _solver_iteration(m, d, ctx, nsolving, compact=compact)
++
++
+ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
+   """Finds forces that satisfy constraints."""
+   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
+@@ -3779,21 +3839,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
+     )
+ 
+   nsolving = scratch_full(d, "solver.nsolving", (1,), int, d.nworld)
+-  if m.opt.iterations != 0 and m.opt.graph_conditional:
+-    # Note: the iteration kernel (indicated by while_body) is repeatedly launched
+-    # as long as condition_iteration is not zero.
+-    # condition_iteration is a warp array of size 1 and type int, it counts the number
+-    # of worlds that are not converged, it becomes 0 when all worlds are converged.
+-    # When the number of iterations reaches m.opt.iterations, solver_niter
+-    # becomes zero and all worlds are marked as converged to avoid an infinite loop.
+-    # note: we only launch the iteration kernel if everything is not done
+-    wp.capture_while(nsolving, while_body=_solver_iteration, m=m, d=d, ctx=ctx, nsolving=nsolving, compact=compact)
+-  else:
+-    # This branch is mostly for when JAX is used as it is currently not compatible
+-    # with CUDA graph conditional.
+-    # It should be removed when JAX becomes compatible.
+-    for _ in range(m.opt.iterations):
+-      _solver_iteration(m, d, ctx, nsolving, compact=compact)
++  _run_solver_iterations(m, d, ctx, nsolving, compact=compact)
+ 
+   # Recover qfrc_constraint (the compacted buffer when run under solve_compact):
+   # the fast path leaves it stale, and the per-iteration zeroing wiped it for
+@@ -4115,7 +4161,12 @@ def solve_compact(m: types.Model, d: types.Data):
+     efc=efc2,
+   )
+ 
+-  sctx = _create_solver_context(m2, d2)
++  # d2 is rebuilt every step by dataclasses.replace, so the per-step scratch cache and
++  # the solver context have to be anchored on the real Data to survive across steps.
++  # Without this the compact (sleep) path allocates a fresh context and a fresh nsolving
++  # counter on every solve, which become memAlloc nodes in a captured step graph.
++  share_scratch(d, d2)
++  sctx = _cached_solver_context(m2, d2, owner=d, slot="_compact_solver_ctx_cache")
+   # compact kernels read the full-coordinate sparse structures (M, J) through
+   # the compaction maps instead of dense products on gathered blocks
+   sctx.compact_m_full = m
+diff --git a/mujoco_warp/_src/stepper.py b/mujoco_warp/_src/stepper.py
+new file mode 100644
+index 0000000..8178717
+--- /dev/null
++++ b/mujoco_warp/_src/stepper.py
+@@ -0,0 +1,382 @@
++# Copyright 2025 The Newton Developers
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Graph-captured stepping with a host-driven solver loop.
++
++``step()`` is captured into a single graph on most platforms. Where conditional graph
++nodes exist, the solver's iteration loop becomes a conditional node that exits as soon as
++every world has converged. Where they do not (HIP/ROCm, and the JAX path), the loop is
++unrolled to the model's full iteration budget and every step replays the whole budget.
++Scenes that budget 100 iterations and converge in 1 therefore replay ~99 iterations of
++dead work per step.
++
++:class:`Stepper` recovers that. It captures the step as three graphs -- everything before
++the solver loop, one batch of solver iterations, and everything after -- and drives the
++middle one from the host, reading the solver's ``nsolving`` counter (the number of worlds
++still converging) between batches and stopping when it hits zero. The cost is one small
++device-to-host read per batch; the saving is the rest of the iteration budget.
++
++The split is produced by recording a real ``step()`` under capture, not by re-deriving
++what a step does, so it stays faithful to whatever ``step()`` actually runs (sleep,
++islands, the compact solve, control callbacks, any integrator). Where the split does not
++apply -- conditional graph nodes available, RK4, no solver loop, more than one solver loop
++per step -- the stepper falls back to capturing ``step()`` as one graph, which is exactly
++what a caller would have written by hand. It also falls back at run time if the first few
++steps show the solver using most of its iteration budget every time, since then there is
++little dead work to skip and the extra graph launches and the host read can cost more.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import warnings
++
++import warp as wp
++
++from mujoco_warp._src import forward
++from mujoco_warp._src import solver
++from mujoco_warp._src import types
++from mujoco_warp._src.warp_util import scratch_snapshot
++
++__all__ = ["Stepper"]
++
++# Largest batch of solver iterations that gets its own captured graph. The batch sizes are
++# powers of two up to this value; the step doubles the batch each time it has to go round
++# again, so a solve that needs n iterations costs O(log n) host reads.
++_MAX_CHUNK = 32
++
++# Steps to watch before concluding the split is not worth its overhead, and the fraction of
++# the iteration budget a solve has to stay under for at least one of them to be worth
++# keeping. A scene that routinely uses most of its budget has a budget that is about the
++# right size, so there is little dead work for the split to skip -- and the extra graph
++# launches and the host read are then likely to cost more than it saves.
++_CALIBRATION_STEPS = 8
++_CALIBRATION_FRACTION = 0.5
++
++
++class _Unsupported(Exception):
++  """Raised while inspecting a model whose step cannot be split."""
++
++
++def _cache_snapshot(d):
++  """Snapshot the lazily built caches that live on Data as non-field attributes.
++
++  A recorded step that turns out not to be splittable has to be thrown away, and with it
++  anything it allocated. Those allocations landed in the caches (solver context, collision
++  context, per-step scratch) and belong to a graph that no longer exists, so the caches
++  have to be rolled back before anything else runs.
++  """
++  fields = {f.name for f in dataclasses.fields(d)}
++  extras = {k: v for k, v in vars(d).items() if k not in fields}
++  scratch = extras.get("_scratch_arrays")
++  return fields, extras, dict(scratch) if scratch is not None else None
++
++
++def _cache_restore(d, snapshot):
++  fields, extras, scratch = snapshot
++  for key in [k for k in vars(d) if k not in fields]:
++    if key in extras:
++      setattr(d, key, extras[key])
++    else:
++      delattr(d, key)
++  if scratch is not None:
++    # Restore in place: the compact solve holds a reference to this same dict.
++    cache = d._scratch_arrays
++    cache.clear()
++    cache.update(scratch)
++
++
++class _SplitRecorder:
++  """Iteration driver that cuts the capture in two at the solver loop.
++
++  Installed as ``solver._iteration_driver`` for the duration of one recorded ``step()``.
++  When ``step()`` reaches the solver's iteration loop this ends the in-progress capture
++  (that becomes the "pre" graph), captures one batch of iterations on its own, and opens a
++  fresh capture for the remainder of the step (the "post" graph).
++  """
++
++  def __init__(self, device, chunk: int):
++    self.device = device
++    self.chunk = chunk
++    self.calls = 0
++    self.pre = None
++    self.chunk_graph = None
++    self.args = None
++
++  def __call__(self, m, d, ctx, nsolving, compact: bool = False):
++    self.calls += 1
++    if self.calls > 1:
++      # A step with more than one solver loop (RK4 runs four) cannot be expressed as
++      # pre/chunk/post. Emit the remaining loops normally so the capture stays valid and
++      # well-formed; the caller checks ``calls`` afterwards and discards the result.
++      solver.emit_solver_iterations(m, d, ctx, nsolving, compact=compact)
++      return
++
++    self.args = (m, d, ctx, nsolving, compact)
++    self.pre = wp.capture_end(device=self.device)
++
++    wp.capture_begin(device=self.device)
++    for _ in range(self.chunk):
++      solver._solver_iteration(m, d, ctx, nsolving, compact=compact)
++    self.chunk_graph = wp.capture_end(device=self.device)
++
++    wp.capture_begin(device=self.device)
++
++
++class Stepper:
++  """A graph-captured ``step()`` that stops solving once every world has converged.
++
++  Construction captures the graphs, which requires that the step's lazily allocated
++  buffers already exist -- otherwise they are allocated inside the capture, become graph
++  allocations, and are neither host-readable nor valid across graphs. ``warmup`` steps are
++  run first to force those allocations, so **constructing a Stepper advances** ``d`` **by**
++  ``warmup`` **steps**. Pass ``warmup=0`` if the Data has already been stepped.
++
++  If the preconditions for splitting are not met the stepper captures ``step()`` as a
++  single graph and behaves exactly like hand-written capture-and-replay; :attr:`split`
++  reports which it did and :attr:`reason` says why.
++
++  Args:
++    m: Model.
++    d: Data. Advanced by ``warmup`` steps during construction.
++    chunk: Fixed number of solver iterations per batch, or ``None`` (default) to use an
++      adaptive schedule that starts from the previous step's iteration count and doubles.
++    warmup: Number of steps to run before capturing, to force lazy allocations.
++    split: ``True`` to require the split (raising if it is not available), ``False`` to
++      force a single monolithic graph, or ``None`` (default) to choose automatically.
++    fn: The function to capture, ``mujoco_warp.step`` by default. Anything with the same
++      ``(m, d)`` signature and exactly one solver loop works, such as ``forward`` or
++      ``step2``.
++    calibrate: Whether to abandon the split, after watching a few steps, if the solver
++      keeps using most of its iteration budget and the split therefore has little to skip.
++  """
++
++  def __init__(
++    self,
++    m: types.Model,
++    d: types.Data,
++    chunk: int | None = None,
++    warmup: int = 3,
++    split: bool | None = None,
++    fn=None,
++    calibrate: bool = True,
++  ):
++    self.m = m
++    self.d = d
++    self.fn = forward.step if fn is None else fn
++    self.device = wp.get_device()
++    self.split = False
++    self.reason = ""
++    self.graph = None
++    self.iterations = int(m.opt.iterations)
++    self.last_iterations = 0
++    self.last_reads = 0
++    self._chunk_graphs = {}
++    self._sizes = [1]
++    self._hint = 1
++    # split=True is a promise to the caller that the split is in use, so it opts out of
++    # the calibration that could later abandon it.
++    self._calibrating = _CALIBRATION_STEPS if (calibrate and split is not True) else 0
++
++    for _ in range(warmup):
++      self.fn(m, d)
++    if warmup:
++      wp.synchronize_device()
++
++    if split is not False:
++      try:
++        self._check_supported(m, d, forced=bool(split))
++        self._record_split(m, d, chunk)
++        self.split = True
++      except _Unsupported as e:
++        self.reason = str(e)
++        if split:
++          raise RuntimeError(f"Stepper cannot split this step: {e}") from None
++
++    if not self.split:
++      with wp.ScopedCapture(device=self.device) as cap:
++        self.fn(m, d)
++      self.graph = cap.graph
++
++  # -- setup ------------------------------------------------------------------------
++
++  def _check_supported(self, m, d, forced: bool):
++    # supports_graph_capture only exists in newer Warp; assume capture works without it.
++    if not self.device.is_cuda or not getattr(self.device, "supports_graph_capture", True):
++      raise _Unsupported("device does not support graph capture")
++    if self.fn is forward.step and m.opt.integrator == types.IntegratorType.RK4:
++      raise _Unsupported("the RK4 integrator runs four solver loops per step")
++    if m.opt.iterations < 2:
++      raise _Unsupported(f"nothing to skip at opt.iterations={m.opt.iterations}")
++    if m.opt.graph_conditional and not forced:
++      # A conditional graph node does this in the graph, with no host round trip.
++      raise _Unsupported("conditional graph nodes already exit the solver at convergence")
++    if "solver.nsolving" not in (getattr(d, "_scratch_arrays", None) or {}):
++      # The convergence counter has to already exist, or it is allocated inside the
++      # capture: a graph allocation, valid only while that graph runs, so neither
++      # host-readable nor usable by the next graph. Checked before capturing anything so
++      # a cold Data costs nothing but the fallback.
++      raise _Unsupported("Data has not been stepped, so the nsolving counter does not exist yet")
++
++  def _capture_split(self, m, d, chunk0):
++    """Record one step, cut in three at the solver loop."""
++    rec = _SplitRecorder(self.device, chunk0)
++    previous = solver._iteration_driver
++    solver._iteration_driver = rec
++    try:
++      if wp.capture_begin(device=self.device) is False:
++        raise _Unsupported("graph capture is disabled on this device")
++      try:
++        self.fn(m, d)
++        post = wp.capture_end(device=self.device)
++      except Exception:
++        self._abort_capture()
++        raise
++    finally:
++      solver._iteration_driver = previous
++
++    if rec.calls == 0:
++      raise _Unsupported("step contains no solver iteration loop")
++    if rec.calls > 1:
++      raise _Unsupported(f"step contains {rec.calls} solver loops")
++    return (*rec.args, rec.pre, rec.chunk_graph, post)
++
++  def _record_split(self, m, d, chunk):
++    chunk0 = 1 if chunk is None else int(chunk)
++    if chunk0 < 1:
++      raise _Unsupported(f"chunk must be at least 1, got {chunk0}")
++
++    snapshot = _cache_snapshot(d)
++    before = scratch_snapshot(d)
++    try:
++      m_s, d_s, ctx, nsolving, compact, pre, chunk_graph, post = self._capture_split(m, d, chunk0)
++    except Exception:
++      _cache_restore(d, snapshot)
++      raise
++
++    if before.get("solver.nsolving", (None,))[0] != nsolving.ptr:
++      _cache_restore(d, snapshot)
++      raise _Unsupported("the nsolving counter was reallocated during capture")
++
++    self.iterations = int(m.opt.iterations)
++    self.nsolving = nsolving
++    self.graph_pre = pre
++    self.graph_post = post
++    self._chunk_graphs = {chunk0: chunk_graph}
++
++    if chunk is None:
++      self._sizes = [1]
++      size = 2
++      while size <= min(_MAX_CHUNK, self.iterations):
++        self._sizes.append(size)
++        size *= 2
++      for size in self._sizes:
++        if size not in self._chunk_graphs:
++          with wp.ScopedCapture(device=self.device) as cap:
++            for _ in range(size):
++              solver._solver_iteration(m_s, d_s, ctx, nsolving, compact=compact)
++          self._chunk_graphs[size] = cap.graph
++    else:
++      self._sizes = [chunk0]
++
++    fresh = [k for k, v in scratch_snapshot(d).items() if before.get(k) != v]
++    if fresh:
++      warnings.warn(
++        f"Stepper captured {len(fresh)} allocation(s) ({', '.join(sorted(fresh)[:4])}); "
++        "step the Data a few more times before constructing the Stepper for allocation-free graphs.",
++        stacklevel=3,
++      )
++
++  def _abort_capture(self):
++    """Close any capture the recorder left open, so a failure does not strand the stream."""
++    for _ in range(3):
++      try:
++        wp.capture_end(device=self.device)
++      except Exception:
++        return
++
++  # -- stepping ---------------------------------------------------------------------
++
++  def step(self):
++    """Run the captured function once. Equivalent to calling ``fn(m, d)`` directly."""
++    if not self.split:
++      wp.capture_launch(self.graph)
++      return
++
++    wp.capture_launch(self.graph_pre)
++
++    budget = self.iterations
++    done = 0
++    reads = 0
++    launches = 0
++    # Start from the batch size that covered the previous step, so a scene with a stable
++    # iteration count settles on one host read per step.
++    size = self._pick(self._hint, budget)
++    while True:
++      wp.capture_launch(self._chunk_graphs[size])
++      launches += 1
++      done += size
++      if done >= budget:
++        # The budget is spent, so the solver is finished either way and there is nothing
++        # left to skip. Break without paying for the read.
++        break
++      reads += 1
++      # Implicit device sync. Iterations past convergence are no-ops (every solver kernel
++      # returns early for a world that is done), so a batch that runs past convergence
++      # only costs replay time, never accuracy.
++      if int(self.nsolving.numpy()[0]) == 0:
++        break
++      size = self._pick(2 * size, budget - done)
++    # Finishing inside the first batch says the batch was big enough but not how much
++    # smaller it could be, so halve it and let the doubling grow it back if that was too
++    # far. Converging steadily in one iteration then costs one iteration, not a stale
++    # oversized batch.
++    self._hint = max(1, (self._hint + 1) // 2) if launches == 1 else done
++    self.last_iterations = done
++    self.last_reads = reads
++
++    wp.capture_launch(self.graph_post)
++
++    if self._calibrating:
++      self._calibrate(done, budget)
++
++  def _calibrate(self, done: int, budget: int):
++    """Give up on the split if it has little to skip.
++
++    The split only pays by ending the solver early. When a scene keeps using most of its
++    iteration budget the saving is small and the extra graph launches and the host read
++    can cost more, so watch the first few steps and switch to a single captured graph --
++    what a caller would have written anyway -- if none of them left much on the table.
++    """
++    self._calibrating -= 1
++    if done < _CALIBRATION_FRACTION * budget:
++      self._calibrating = 0  # the split is paying for itself; stop watching
++      return
++    if self._calibrating:
++      return
++    with wp.ScopedCapture(device=self.device) as cap:
++      self.fn(self.m, self.d)
++    self.graph = cap.graph
++    self.graph_pre = self.graph_post = None
++    self._chunk_graphs = {}
++    self.split = False
++    self.reason = f"the solver used most of its {budget}-iteration budget on every calibration step"
++
++  def _pick(self, want: int, remaining: int) -> int:
++    """The largest captured batch size that is neither above ``want`` nor overshoots the
++    remaining budget by a whole batch."""
++    cap = min(want, max(remaining, 1), self._sizes[-1])
++    return max([s for s in self._sizes if s <= cap] or [self._sizes[0]])
++
++  __call__ = step
+diff --git a/mujoco_warp/_src/stepper_test.py b/mujoco_warp/_src/stepper_test.py
+new file mode 100644
+index 0000000..e443a31
+--- /dev/null
++++ b/mujoco_warp/_src/stepper_test.py
+@@ -0,0 +1,235 @@
++# Copyright 2025 The Newton Developers
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Tests for the host-driven solver stepper."""
++
++import dataclasses
++
++import mujoco
++import numpy as np
++import warp as wp
++from absl.testing import absltest
++from absl.testing import parameterized
++
++import mujoco_warp as mjw
++from mujoco_warp import test_data
++
++# Trajectories are compared between two runs of the same kernels on the same device, so
++# they agree to well within physics tolerances; the slack is for the reduction-order
++# nondeterminism mujoco_warp has on its own (atomics in the constraint assembly), which
++# two plain mjw.step runs show just as much of as the stepper does. _RTOL bounds it
++# relative to the magnitude of the quantity being compared.
++_TOL = 1e-5
++_RTOL = 1e-3
++
++_STATE = ("qpos", "qvel", "qacc", "act", "qfrc_constraint", "sensordata")
++
++_NSTEP = 20
++
++
++def _state(d):
++  return {k: getattr(d, k).numpy().copy() for k in _STATE}
++
++
++def _unrolled(m):
++  """A copy of the model that unrolls the solver loop, as platforms without conditional
++  graph nodes do. Lets the split be exercised on any device."""
++  return dataclasses.replace(m, opt=dataclasses.replace(m.opt, graph_conditional=False))
++
++
++class StepperTest(parameterized.TestCase):
++  def setUp(self):
++    super().setUp()
++    if not wp.get_device().is_cuda:
++      self.skipTest("stepper requires a device with graph capture")
++
++  def _compare(self, mjm, nworld=8, chunk=None, split=True, **kwargs):
++    """Step three Datas from an identical state: two with mjw.step, one with a Stepper.
++
++    The two mjw.step runs are the control. mujoco_warp's constraint assembly uses atomics,
++    so trajectories diverge slightly run to run on their own; the stepper only has to stay
++    inside that spread, which is a much sharper claim than an absolute tolerance would be
++    on the platforms where the spread is wide.
++    """
++    mjd = mujoco.MjData(mjm)
++    mujoco.mj_forward(mjm, mjd)
++    m = _unrolled(mjw.put_model(mjm))
++    d_ref = mjw.put_data(mjm, mjd, nworld=nworld, **kwargs)
++    d_ctl = mjw.put_data(mjm, mjd, nworld=nworld, **kwargs)
++    d_run = mjw.put_data(mjm, mjd, nworld=nworld, **kwargs)
++
++    # identical warmup on all three so the trajectories start aligned; capture does not
++    # execute, so building the stepper leaves d_run's state untouched
++    for _ in range(3):
++      mjw.step(m, d_ref)
++      mjw.step(m, d_ctl)
++      mjw.step(m, d_run)
++    wp.synchronize_device()
++
++    stepper = mjw.Stepper(m, d_run, chunk=chunk, warmup=0, split=split)
++    for _ in range(_NSTEP):
++      mjw.step(m, d_ref)
++    for _ in range(_NSTEP):
++      mjw.step(m, d_ctl)
++    for _ in range(_NSTEP):
++      stepper.step()
++    wp.synchronize_device()
++
++    ref, ctl, run = _state(d_ref), _state(d_ctl), _state(d_run)
++    for key in _STATE:
++      if not ref[key].size:
++        continue
++      got = np.abs(run[key] - ref[key]).max()
++      control = np.abs(ctl[key] - ref[key]).max()
++      scale = np.abs(ref[key]).max()
++      # The control is one sample of a noisy quantity, so it alone would make the test
++      # flaky; the relative floor covers the case where the stepper happens to draw a
++      # wider sample than the control did. A split that actually skipped needed solver
++      # work shows up as an O(1) relative difference, far above either bound.
++      self.assertLessEqual(
++        got,
++        max(_TOL, 4 * control, _RTOL * scale),
++        f"mismatch: {key} (stepper {got:.3e}, mjw.step-to-mjw.step control {control:.3e}, scale {scale:.3e})",
++      )
++    return stepper, d_run
++
++  @parameterized.parameters("humanoid/humanoid.xml", "pendula.xml", "constraints.xml")
++  def test_matches_step(self, path):
++    mjm, _, _, _ = test_data.fixture(path, nworld=1)
++    stepper, _ = self._compare(mjm)
++    self.assertTrue(stepper.split)
++
++  def test_matches_step_fixed_chunk(self):
++    mjm, _, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    stepper, _ = self._compare(mjm, chunk=4)
++    self.assertTrue(stepper.split)
++    self.assertEqual(stepper.last_iterations % 4, 0)
++
++  @parameterized.parameters("humanoid/humanoid.xml", "humanoid/n_humanoid.xml")
++  def test_matches_step_sleep(self, path):
++    """Sleep routes every solve through the compact solver; n_humanoid also has enough
++    kinematic trees to exercise the island mapping."""
++    mjm, _, _, _ = test_data.fixture(path, nworld=1)
++    mjm.opt.enableflags |= mujoco.mjtEnableBit.mjENBL_SLEEP
++    stepper, _ = self._compare(mjm, nvmax=mjm.nv)
++    self.assertTrue(stepper.split)
++
++  @parameterized.parameters(mujoco.mjtIntegrator.mjINT_IMPLICITFAST, mujoco.mjtIntegrator.mjINT_EULER)
++  def test_matches_step_integrator(self, integrator):
++    mjm, _, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    mjm.opt.integrator = integrator
++    stepper, _ = self._compare(mjm)
++    self.assertTrue(stepper.split)
++
++  def test_captures_forward(self):
++    """Any (m, d) function with one solver loop can be captured, not just step."""
++    mjm, mjd, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    m = _unrolled(mjw.put_model(mjm))
++    d_ref = mjw.put_data(mjm, mjd, nworld=4)
++    d_run = mjw.put_data(mjm, mjd, nworld=4)
++    for _ in range(3):
++      mjw.forward(m, d_ref)
++      mjw.forward(m, d_run)
++    wp.synchronize_device()
++    stepper = mjw.Stepper(m, d_run, warmup=0, split=True, fn=mjw.forward)
++    mjw.forward(m, d_ref)
++    stepper.step()
++    wp.synchronize_device()
++    scale = max(np.abs(d_ref.qacc.numpy()).max(), 1.0)
++    self.assertLessEqual(np.abs(d_run.qacc.numpy() - d_ref.qacc.numpy()).max(), _RTOL * scale)
++
++  def test_early_exit(self):
++    """The loop must stop just after convergence rather than replaying the whole budget."""
++    mjm, _, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    mjm.opt.iterations = 100
++    stepper, d = self._compare(mjm)
++    niter = max(int(d.solver_niter.numpy().max()), 1)
++    self.assertGreaterEqual(stepper.last_iterations, niter)
++    # the doubling schedule overshoots convergence by at most one batch
++    self.assertLess(stepper.last_iterations, 2 * niter + 2)
++
++  # -- fallbacks --------------------------------------------------------------------
++
++  def test_fallback_rk4(self):
++    """RK4 runs four solver loops per step, so it takes the monolithic path."""
++    mjm, _, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    mjm.opt.integrator = mujoco.mjtIntegrator.mjINT_RK4
++    stepper, _ = self._compare(mjm, split=None)
++    self.assertFalse(stepper.split)
++    self.assertIn("RK4", stepper.reason)
++    with self.assertRaises(RuntimeError):
++      mjw.Stepper(_unrolled(mjw.put_model(mjm)), mjw.put_data(mjm, mujoco.MjData(mjm), nworld=2), split=True)
++
++  def test_fallback_single_iteration(self):
++    mjm, _, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    mjm.opt.iterations = 1
++    stepper, _ = self._compare(mjm, split=None)
++    self.assertFalse(stepper.split)
++
++  def test_fallback_conditional_graph(self):
++    """With conditional graph nodes the loop already exits at convergence in the graph."""
++    if not wp.is_conditional_graph_supported():
++      self.skipTest("device has no conditional graph nodes")
++    mjm, _, m, d = test_data.fixture("humanoid/humanoid.xml", nworld=2)
++    self.assertTrue(m.opt.graph_conditional)
++    stepper = mjw.Stepper(m, d)
++    self.assertFalse(stepper.split)
++    self.assertIn("conditional", stepper.reason)
++
++  def test_calibration_abandons_a_split_that_never_pays(self):
++    """A model that always uses its whole budget should end up on the monolithic graph."""
++    mjm, mjd, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    mjm.opt.iterations = 4
++    m = _unrolled(mjw.put_model(mjm))
++    d = mjw.put_data(mjm, mjd, nworld=4)
++    # a batch as big as the budget can never end the solver early, whatever the scene does
++    stepper = mjw.Stepper(m, d, chunk=int(mjm.opt.iterations))
++    self.assertTrue(stepper.split)
++    for _ in range(12):
++      stepper.step()
++    wp.synchronize_device()
++    self.assertFalse(stepper.split)
++    self.assertIn("budget", stepper.reason)
++    # and the monolithic graph it swapped in is a working step
++    before = d.time.numpy().copy()
++    stepper.step()
++    wp.synchronize_device()
++    np.testing.assert_allclose(d.time.numpy(), before + mjm.opt.timestep, rtol=1e-6)
++
++  def test_fallback_cold_data(self):
++    """A Data that has never stepped cannot supply a host-readable convergence counter."""
++    mjm, mjd, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    m = _unrolled(mjw.put_model(mjm))
++    d = mjw.put_data(mjm, mjd, nworld=2)
++    stepper = mjw.Stepper(m, d, warmup=0)
++    self.assertFalse(stepper.split)
++    self.assertIn("stepped", stepper.reason)
++    # the fallback graph must still be a working step
++    before = d.time.numpy().copy()
++    stepper.step()
++    wp.synchronize_device()
++    np.testing.assert_allclose(d.time.numpy(), before + mjm.opt.timestep, rtol=1e-6)
++
++  def test_warmup_advances_data(self):
++    mjm, mjd, _, _ = test_data.fixture("humanoid/humanoid.xml", nworld=1)
++    m = _unrolled(mjw.put_model(mjm))
++    d = mjw.put_data(mjm, mjd, nworld=2)
++    stepper = mjw.Stepper(m, d, warmup=3)
++    np.testing.assert_allclose(d.time.numpy(), 3 * mjm.opt.timestep, rtol=1e-6)
++    self.assertTrue(stepper.split)
++
++
++if __name__ == "__main__":
++  wp.init()
++  absltest.main()
+diff --git a/mujoco_warp/_src/warp_util.py b/mujoco_warp/_src/warp_util.py
+index 36ab229..07115bf 100644
+--- a/mujoco_warp/_src/warp_util.py
++++ b/mujoco_warp/_src/warp_util.py
+@@ -181,6 +181,33 @@ def scratch_full(d, key: str, shape, dtype, value):
+   return arr
+ 
+ 
++def share_scratch(src, dst):
++  """Point ``dst`` at ``src``'s scratch cache.
++
++  Used where a shallow ``dataclasses.replace`` copy of Data is rebuilt every step (the
++  compact solve): the copy would otherwise start with an empty cache and reallocate its
++  scratch on every call.
++  """
++  cache = getattr(src, "_scratch_arrays", None)
++  if cache is None:
++    cache = {}
++    src._scratch_arrays = cache
++  dst._scratch_arrays = cache
++  return dst
++
++
++def scratch_snapshot(d) -> dict:
++  """Snapshot the identity of every cached scratch array on ``d``.
++
++  Comparing snapshots taken around a graph capture tells whether the capture allocated
++  scratch. Anything allocated inside a capture is a graph allocation: it is only valid
++  while that graph runs, so it must not be read from the host or shared with another
++  graph.
++  """
++  cache = getattr(d, "_scratch_arrays", None) or {}
++  return {k: (v.ptr, v.shape) for k, v in cache.items()}
++
++
+ def check_toolkit_driver():
+   wp.init()
+   device = wp.get_device()

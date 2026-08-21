@@ -1,7 +1,7 @@
 # Warp + mujoco_warp on MI350X — collaborator handoff
 
 *Goal: make Warp (and by extension mujoco_warp) fully validated and **super optimized** on
-AMD Instinct MI350X (gfx950). Status as of 2026-08-17.*
+AMD Instinct MI350X (gfx950). Status as of 2026-08-18.*
 
 ## What this branch is
 
@@ -91,8 +91,8 @@ scratch allocations *inside* the capture and re-inherits the alloc nodes (hence 
 Validated: full mujoco_warp suite green with both fixes (1,233 passed / 0 failed).
 
 Remaining perf levers, in evidence order (see the cross-vendor section for the data):
-**(1) conditional graph nodes** — AMD-blocked, worth ~2-4× on solver-heavy scenes since we
-replay a fixed 10 solver iterations where NVIDIA exits at ~3; **(2) collision kernels** —
+**(1) conditional graph nodes** — was AMD-blocked and worth ~2-4× on solver-heavy scenes;
+**recovered in software 2026-08-18 by `mjw.Stepper`**, see below; **(2) collision kernels** —
 `aloha_sdf` and `unitree_g1_hfield` are the only scenes warm capture did not help, so their
 cost is collision compute; **(3) the 7 residual warm-graph allocations** on hfield.
 Already tried and refuted, with data: MFMA/rocWMMA tile matmul (no gain at mujoco's 16x16
@@ -236,53 +236,158 @@ reversed-order control proved it -- whichever suite ran *second* took ~5.5 min e
 Suite wall-clock here measures JIT compilation, not physics. The patch's real perf effect
 is in the graph-node counts and per-step timings elsewhere in this document.
 
-### Prototype: recovering the conditional-node win without AMD (2026-08-17)
+### Recovering the conditional-node win without AMD: `mjw.Stepper` (2026-08-18)
 
-`rocm-tools/chunked_stepper.py` emulates conditional-graph early exit with host-side
-control. It splits the step into three captured graphs -- **pre** (forward dynamics +
-solver init), **chunk** (K solver iterations), **post** (solver tail + sensor_acc +
-integrator) -- and loops on the chunk graph from the host, reading the 1-int `nsolving`
-counter between chunks to stop at convergence. The seam is clean because `_solve`
-decomposes into init / loop / one conditional tail launch, and `m.opt.iterations = 0`
-makes it skip exactly the loop; the solver context it needs already persists on `Data`
-thanks to the scratch cache.
+**Status: implemented in `patches/mujoco_warp-chunked-stepper.patch`, validated on both
+vendors, and shaped as an upstream PR to google-deepmind/mujoco_warp.** It supersedes the
+`rocm-tools/chunked_stepper.py` prototype (kept for reference).
 
-Validated on both vendors (chunk=1; chunk=2 is slightly worse since these scenes converge
-in one iteration):
+The idea is unchanged: split the step into three captured graphs -- **pre** (forward
+dynamics + solver init), **chunk** (K solver iterations), **post** (solver tail +
+sensor_acc + integrator) -- and drive the middle one from the host, reading the 1-int
+`nsolving` counter between batches to stop at convergence. What changed is how the split
+is produced and how it fails.
 
-| scene | MI350X reference | MI350X chunked | **speedup** | ceiling | L40S speedup |
+**The split is recorded, not re-derived.** The prototype reimplemented `forward()` by
+copy-paste, so it silently did the wrong thing on sleep, islands, the compact solve and
+user callbacks. Instead, `solver._solve` now calls the loop through a one-line indirection
+(`_run_solver_iterations`), and `Stepper` installs an *iteration driver* into it while it
+captures one real `mjw.step(m, d)`. When the recorded step reaches the solver loop the
+driver ends the capture (that is `pre`), captures a batch of iterations on its own, and
+opens a fresh capture for the rest of the step (`post`). Nothing about `step()` is
+duplicated, so every configuration it supports is supported by construction, and `step()`
+itself is untouched.
+
+**It degrades to today's behavior.** `Stepper.step()` is always semantically
+`mjw.step(m, d)`; the only question is how many graphs it is. It declines the split and
+captures one monolithic graph -- exactly what a caller writes by hand today -- when
+conditional graph nodes exist (CUDA), for RK4 (four solver loops per step), for
+`iterations < 2`, on a `Data` that has never been stepped, or if the recording finds a
+number of solver loops other than one. It also abandons the split at run time if the first
+eight steps all used more than half their iteration budget, since then there is little dead
+work to skip; it captures the monolithic graph lazily at that point and switches.
+`stepper.split` and `stepper.reason` report which and why; `split=True` turns the decline
+into an error (and pins the split) for tests and benchmarks. A declined recording rolls
+back everything it allocated, so the fallback graph is not poisoned by buffers belonging to
+a discarded capture.
+
+**Batch size adapts.** Chunk graphs are captured at sizes 1, 2, 4, ... 32; each step starts
+from the batch that covered the previous step and doubles, clamped so it never overshoots
+the iteration budget. A solve needing *n* iterations costs O(log n) host reads, and a scene
+with a stable iteration count settles on one -- or zero, when the batch already covers the
+whole budget and there is nothing left to skip. `chunk=K` pins a fixed size instead.
+
+**Supporting fixes it needed** (all also remove per-step allocation nodes on both vendors):
+the compact/sleep solve rebuilt its `SolverContext` and its `nsolving` counter on every
+step, because it runs on a `dataclasses.replace` copy of `Data` that the caches could not
+survive; both are now anchored on the real `Data`. Without this the sleep path's chunk
+graph would reference buffers freed since capture. The sparse-flex diagonal preconditioner
+was likewise allocated per solve and read by every iteration, so it is now Data-cached.
+
+Measured on MI350X, warm capture, adaptive batch, **auto policy (no forcing)** -- reference
+is the monolithic warm-captured graph, the current best practice
+(`rocm-tools/stepper_validate.py`, job `amd-16888525`):
+
+| scene | reference | Stepper | **speedup** | iters/budget | host reads/step |
 |---|---|---|---|---|---|
-| franka | 6.546 ms | **1.688 ms** | **3.88x** | 4.24x | 1.00x |
-| humanoid | 4.703 ms | **1.573 ms** | **2.99x** | 3.38x | 1.00x |
-| unitree_g1_flat | 5.540 ms | 5.319 ms | 1.04x | 1.14x | 1.00x |
+| franka_emika_panda | 6.519 ms | **1.711 ms** | **3.81x** | 2 / 100 | 1 |
+| humanoid | 4.880 ms | **1.813 ms** | **2.69x** | 6 / 100 | 2 |
+| aloha_pot | 17.799 ms | **10.801 ms** | **1.65x** | 2 / 100 | 1 |
+| **aloha_clutter (SLEEP, 22 trees, compact solve)** | 20.461 ms | **12.498 ms** | **1.64x** | 1 / 100 | 1 |
+| three_humanoids | 12.370 ms | **7.597 ms** | **1.63x** | 3 / 100 | 2 |
+| unitree_g1_flat | 5.558 ms | 5.617 ms | 0.99x | 8 / 10 | 2 |
+| unitree_g1_hfield | 10.371 ms | 10.461 ms | 0.99x | 10 / 10 | — (abandoned) |
 
-Each lands just under its measured ceiling -- the shortfall is the per-chunk host sync --
-and costs nothing on CUDA, where conditional nodes already do this in hardware.
+The gain tracks exactly how much of the budget the solve leaves unused -- the quantity a
+conditional node exploits. franka lands just under its independently measured 4.24x
+ceiling; the shortfall is the host read. The two scenes at 0.99x are the honest floor:
+their 10-iteration budget is about right-sized, so there is almost nothing to skip. hfield
+uses all 10 and the run-time calibration abandons the split for it; g1_flat uses 8 of 10,
+which is enough early exit to keep the split but not enough to pay for it.
 
-Faithfulness, checked against unmodified `mjw.step` over 10 steps from an aligned start,
-with a control of a second independent `mjw.step` run (MI350X):
+**End-to-end through `testspeed`** (1000 steps, `--chunked_solver` on vs off, MI350X) --
+this replaces the earlier projection with measured suite numbers:
 
-| scene | chunked vs ref | ref vs ref (control) |
+| scene | chunked off | **chunked on** | ratio | L40S (same harness) | gap before | **gap now** |
+|---|---|---|---|---|---|---|
+| franka_emika_panda | 5,028,269 | **19,301,515** | **3.84x** | 22,208,930 | 4.37x | **1.15x** |
+| humanoid | 1,410,934 | **2,740,697** | **1.94x** | 5,474,229 | 3.92x | **2.00x** |
+| unitree_g1_flat | 1,658,881 | 1,597,235 | 0.96x | 2,119,598 | 1.41x | 1.33x |
+
+franka goes from 4.37x behind an L40S to **1.15x**, humanoid from 3.92x to 2.00x. g1_flat
+loses 4%.
+
+On CUDA the auto policy declines the split, so it is a measured **1.00x on all seven
+scenes** -- the feature cannot regress a platform that already has conditional nodes.
+
+To test the *decomposition* rather than the platform, the same scenes ran on an L40S with
+`opt.graph_conditional` forced off, which makes CUDA unroll the budget exactly as HIP does
+(`STEPPER_UNROLL=1`). This is the apples-to-apples check, on a quiet node, and it covers the
+paths the prototype could not reach:
+
+| scene (L40S, unrolled reference) | reference | Stepper | speedup |
+|---|---|---|---|
+| franka_emika_panda | 6.896 ms | 1.590 ms | **4.34x** |
+| humanoid | 4.216 ms | 1.009 ms | **4.18x** |
+| aloha_pot | 15.556 ms | 4.851 ms | **3.21x** |
+| **aloha_clutter (SLEEP, 22 trees, compact solve)** | 11.021 ms | 4.087 ms | **2.70x** |
+| three_humanoids | 11.653 ms | 6.577 ms | 1.77x |
+| unitree_g1_flat | 4.844 ms | 4.689 ms | 1.03x |
+| unitree_g1_hfield | 8.886 ms | 9.326 ms | 0.95x (abandoned mid-measurement) |
+
+**Faithfulness.** Every scene is checked against unmodified `mjw.step` over 10 steps from
+an aligned start, against a control of a second independent `mjw.step` run -- the only
+meaningful yardstick, since mujoco_warp's constraint assembly uses atomics and diverges
+run-to-run on its own. On MI350X franka is **bit-identical (0.000e+00, control 0.000e+00)**
+and every other scene's stepper delta sits at its control:
+
+| MI350X, 10 steps | stepper vs ref | control (ref vs ref) |
 |---|---|---|
-| franka | **0.000e+00** (bit-identical) | 0.000e+00 |
-| humanoid | 6.079e-07 | 5.839e-07 |
-| unitree_g1_flat | 2.327e-06 | 2.428e-06 |
+| franka_emika_panda | **0.000e+00** | 0.000e+00 |
+| aloha_pot | 1.049e-05 | 1.013e-05 |
+| aloha_clutter | 7.057e-05 | 6.962e-05 |
+| humanoid | 3.906e-03 | 3.891e-03 |
+| three_humanoids | 4.440e-03 | 4.120e-03 |
+| unitree_g1_flat | 4.669e-03 | 4.837e-03 |
+| unitree_g1_hfield | 2.620e+03 | 2.773e+03 |
 
-franka is exact; the others sit inside mujoco_warp's own run-to-run nondeterminism. Same
-picture on the L40S (4.5e-13 / 5.1e-07 / 2.4e-06 against controls of the same magnitude).
+(hfield's absolute numbers are large because the scene is chaotic over 10 steps -- the
+control is the point, not the magnitude.) Same picture on the L40S in both modes. A probe
+(`rocm-tools/stepper_niter_probe.py`) confirmed the mechanism directly: a Stepper pinned to
+`chunk=iterations`, which runs *exactly* what the unrolled reference runs, differs from the
+reference by the same amount as `chunk=1` does. The residual is nondeterminism, not the
+split.
 
-**Projected suite impact** (applying the measured per-scene speedups to the warm sweep --
-a projection, the stepper is not wired into `testspeed`): franka 5.08M -> ~19.7M steps/s
-vs L40S 22.2M (**1.13x**), humanoid 1.40M -> ~4.18M vs 5.47M (**1.31x**), g1_flat 1.51M ->
-~1.57M vs 2.12M (1.35x). That would put these three scenes near parity with the L40S,
-versus 4.37x / 3.92x / 1.41x today.
+`mujoco_warp/_src/stepper_test.py` covers trajectory equivalence (default, sleep+islands,
+Euler/implicitfast, fixed chunk, capturing `forward` instead of `step`), early exit, the
+calibration hand-off, and every fallback: **16 passed on the L40S** (three consecutive runs,
+no flakes), **15 passed + 1 principled skip on MI350X** (the conditional-graph fallback test
+has nothing to assert on HIP). The modules the solver refactor touches (solver, sleep,
+forward, island): **215 passed on the L40S, 211 passed + 4 skips on MI350X**, zero failures.
+The **full mujoco_warp suite on the L40S with both patches applied: 1,257 passed, 22
+skipped, 0 failed** -- pristine upstream is 1,241 passed / 22 skipped, so that is the same
+1,241 plus the 16 new tests.
 
-**Status**: prototype, not landed in the library. Productionizing means deciding how users
-opt in (mujoco_warp's `step()` is monolithic by design), and the AMD-side timing rerun with
-the control is still queued. Known constraint, enforced by an assert: the stepper requires a
-warmed `Data` -- built on a cold one, the `nsolving` counter is allocated *inside* the
-capture as a graph allocation and cannot be read from the host (the failed read also
-poisons the HIP context and aborts the process).
+**Known gaps.** RK4 falls back (it runs four solver loops; a multi-loop split is possible
+but was not built). The calibration's threshold is a heuristic on iteration counts, not a
+timing measurement, so it catches the clear case (hfield, 10/10) and not the marginal one
+(g1_flat, 8/10, which costs 4% end to end on MI350X and *gains* 3% on the L40S -- the sign
+is platform-dependent, which is why a fixed heuristic cannot get both). Constructing a
+Stepper advances the Data by `warmup` steps; there is no snapshot/restore.
+
+**Opt-in.** `mjw.Stepper(m, d)` -- an object, not a flag, because a captured stepper owns
+graphs with a lifetime and `step()` is deliberately monolithic. Constructing it advances
+`d` by `warmup` steps (default 3) to force the lazy allocations that capture must not make;
+`warmup=0` for an already-stepped `Data`. `fn=` captures something other than `step`
+(`forward`, `step2`). `cli.unroll` uses it automatically (`--chunked_solver`, default on),
+so `testspeed` and the benchmark suite pick the win up without changes.
+
+**Where it belongs: upstream.** The change is vendor-neutral and additive -- `step()` is
+unchanged, the loop indirection is pure code motion, and on CUDA the policy declines the
+split. It is not only an AMD workaround: `m.opt.graph_conditional=False` is also the
+documented JAX path, and those users eat the full unrolled budget on CUDA today. Carrying
+it in our patch stack indefinitely means rebasing a 790-line diff against a fast-moving
+upstream.
 
 **Corrected long-standing issue**: the cloth family (`cloth`, `cloth_render`,
 `aloha_cloth`) overflows on the **L40S too** (22/31/31 worlds vs our 26/29/29) with the
@@ -293,10 +398,12 @@ ours to triage.
 
 Where the remaining gap actually lives, now that allocation noise is gone:
 
-1. **Conditional graph nodes (still AMD-blocked).** The L40S graph has **144 kernel nodes
-   plus a conditional node**; ours has **288 unrolled** kernel nodes. NVIDIA's `capture_while`
-   exits the solver at convergence (~3 iterations on G1); we must replay the full fixed
-   budget (10). This is structural, not tuning, and only AMD can unblock it.
+1. ~~**Conditional graph nodes (AMD-blocked).**~~ — **largely recovered 2026-08-18** by
+   `mjw.Stepper` (section above): host-driven solver batches buy 3.86x on franka, 3.07x on
+   humanoid, 1.72x on three_humanoids, at the cost of ~1 host read per step. Still worth
+   asking AMD for real conditional nodes -- they would remove the reads entirely and the
+   ~1-2% they cost on scenes that use their whole iteration budget -- but this is no longer
+   a blocker.
 2. **Collision-dominated scenes.** `aloha_sdf` (12.2x) and `unitree_g1_hfield` (10.4x)
    barely improved from warm capture -- their cost is collision compute, not allocation.
    These are the top targets for our own optimization work.
@@ -432,12 +539,21 @@ fixed on clr `develop` as `fa77aed` but unreleased — ask for a 7.2.x backport;
 # on the cluster, in /matx/u/$USER
 git clone -b rocm-117 https://github.com/nataliakokoromyti/warp.git warp-rocm
 git clone https://github.com/google-deepmind/mujoco_warp.git
-cd mujoco_warp && git apply ../warp-rocm/patches/mujoco_warp-rocm-compat.patch && cd ..
+cd mujoco_warp
+git apply ../warp-rocm/patches/mujoco_warp-rocm-compat.patch      # ROCm compat + scratch cache
+git apply ../warp-rocm/patches/mujoco_warp-chunked-stepper.patch  # mjw.Stepper (order matters)
+cd ..
 # edit paths in warp-rocm/rocm-tools/slurm/*.sbatch, then:
 sbatch warp-rocm/rocm-tools/slurm/warp_build.sbatch   # build + SAXPY/tile smoke test
 sbatch warp-rocm/rocm-tools/slurm/mjw_probe.sbatch    # full mujoco_warp test suite
 sbatch warp-rocm/rocm-tools/slurm/mjw_bench.sbatch    # benchmark suite
 ```
+
+`rocm-tools/stepper_validate.py` is the Stepper's validation harness (one benchmark scene
+per process; speedup vs a monolithic warm graph, plus a trajectory check against
+`mjw.step` with a nondeterminism control). `STEPPER_FORCE=1` unrolls the solver loop and
+requires the split, which is how the decomposition is validated on CUDA. Job templates:
+`rocm-tools/slurm/stepper_{amd,nv}.sbatch`.
 
 `rocm-tools/` also has the diagnostics used in this effort: `graph_overhead.py` (graph replay
 cost vs node count), `graph_census.py` (node-type census of a captured step graph),
