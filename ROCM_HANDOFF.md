@@ -32,6 +32,28 @@ HIP graph-capture PR #15 + our fixes; fully validated but frozen. Full backgroun
 - **Every benchmark scene now runs** (2026-08-18): `primitives`, the last AMD-only failure,
   was an oversized launch and is fixed — 313,893 steps/s.
 
+### Integrated validation of the five-agent pass (2026-08-21)
+
+All five workstreams merged into `rocm-117` (83 commits) and validated **as a combined
+tree** — not five separate green runs — via `rocm-tools/slurm/validate.sbatch`:
+
+| gate | result |
+|---|---|
+| build | PASS |
+| Warp suite | 8302 tests, **1 failure**, 172 skipped |
+| flaky-class watch | PASS |
+| mujoco_warp suite | **1233 passed / 0 failed** / 30 skipped |
+| benchmarks | PASS |
+
+The single Warp failure is `test_module_option_override_cuda_0` — surfaced by the
+determinism fix (previously masked by the broken CPU fallback), reproducible only in a full
+suite run, passing in isolation, and almost certainly not HIP-specific. A previous run of
+the same tree showed two additional `test_copy_*` failures which did **not** recur; both
+have `PoolOff` in their names, i.e. they are the probabilistic XCD dropout of issue 0 — the
+run-to-run variation is itself consistent with that diagnosis.
+
+Skips fell 240 → 172 because the deterministic suite is now ungated and actually running.
+
 ## Our fixes (each upstreamable; see git log)
 
 Warp, on the 1.17 base (`rocm-117`): re-enabled **HIP graph capture** (the dev base gated
