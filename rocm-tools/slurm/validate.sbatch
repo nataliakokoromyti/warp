@@ -74,7 +74,11 @@ echo "############ 4/5 mujoco_warp suite ############"
 pip install -q absl-py "etils[epath]" "mujoco>=3.11.0" pytest pytest-timeout 2>&1 | tail -2
 pip install -q --no-deps -e "$MJW_DIR"
 cd "$MJW_DIR" || exit 1
-python -m pytest mujoco_warp -q --timeout=600 2>&1 | tail -12 | tee "$TMPDIR/mjw.txt"
+# capture the FULL output first: piping through `tail` before `tee` truncates the
+# pytest summary away whenever the run ends with simulation warnings, which makes the
+# grep below report FAIL on a green suite
+python -m pytest mujoco_warp -q --timeout=600 > "$TMPDIR/mjw.txt" 2>&1
+tail -12 "$TMPDIR/mjw.txt"
 if grep -qE "[0-9]+ passed" "$TMPDIR/mjw.txt" && ! grep -qE "[0-9]+ failed" "$TMPDIR/mjw.txt"; then
   record mjw_suite PASS
 else
