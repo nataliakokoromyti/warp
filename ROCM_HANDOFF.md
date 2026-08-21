@@ -6,7 +6,7 @@ AMD Instinct MI350X (gfx950). Status as of 2026-08-18.*
 ## What this branch is
 
 **`rocm-117` (current)** = [AMD-Ecosystem/warp](https://github.com/AMD-Ecosystem/warp)
-`amd-integeration-dev` (AMD's re-port of Warp onto near-current upstream — **Warp
+`amd-integration-dev` (AMD's re-port of Warp onto near-current upstream — **Warp
 1.17.0.dev2**, ~17 commits behind nvidia/warp main as of 2026-08-13) + our fixes ported
 forward. This natively satisfies mujoco_warp's `warp-lang>=1.15` requirement — no shims.
 
@@ -92,9 +92,12 @@ Validated: full mujoco_warp suite green with both fixes (1,233 passed / 0 failed
 
 Remaining perf levers, in evidence order (see the cross-vendor section for the data):
 **(1) conditional graph nodes** — was AMD-blocked and worth ~2-4× on solver-heavy scenes;
-**recovered in software 2026-08-18 by `mjw.Stepper`**, see below; **(2) collision kernels** —
-`aloha_sdf` and `unitree_g1_hfield` are the only scenes warm capture did not help, so their
-cost is collision compute; **(3) the 7 residual warm-graph allocations** on hfield.
+**recovered in software 2026-08-18 by `mjw.Stepper`**, see below; **(2) `_sdf_narrowphase`** —
+was the one collision kernel slower on AMD, **fixed 2026-08-18** (unreachable device printf +
+static octree index: 14.0× on the kernel, 2.20× end-to-end on aloha_sdf), leaving an
+as-yet-unattributed 3.92× residual vs the L40S; the rest of the collision stack is *faster*
+than an L40S, so hfield and clutter belong under lever 1; ~~**(3) the 7 residual warm-graph
+allocations** on hfield~~ — fixed.
 Already tried and refuted, with data: MFMA/rocWMMA tile matmul (no gain at mujoco's 16x16
 tiles) and wave-aware block sizing (slower). The scratch cache is a strong upstream
 candidate for google-deepmind/mujoco_warp (CUDA graphs carry the same alloc nodes — 34 of
@@ -399,14 +402,14 @@ ours to triage.
 Where the remaining gap actually lives, now that allocation noise is gone:
 
 1. ~~**Conditional graph nodes (AMD-blocked).**~~ — **largely recovered 2026-08-18** by
-   `mjw.Stepper` (section above): host-driven solver batches buy 3.86x on franka, 3.07x on
-   humanoid, 1.72x on three_humanoids, at the cost of ~1 host read per step. Still worth
-   asking AMD for real conditional nodes -- they would remove the reads entirely and the
-   ~1-2% they cost on scenes that use their whole iteration budget -- but this is no longer
-   a blocker.
-2. **Collision-dominated scenes.** `aloha_sdf` (12.2x) and `unitree_g1_hfield` (10.4x)
-   barely improved from warm capture -- their cost is collision compute, not allocation.
-   These are the top targets for our own optimization work.
+   `mjw.Stepper` (section above): host-driven solver batches, at the cost of ~1 host read
+   per step. Still worth asking AMD for real conditional nodes -- they would remove the
+   reads entirely and the ~1-2% they cost on scenes that use their whole iteration budget --
+   but this is no longer a blocker.
+2. ~~**Collision-dominated scenes.**~~ — **retired 2026-08-18**, see "Collision compute is
+   an AMD strength" below. Isolated per-phase timings on both vendors show collision is
+   *faster* on MI350X in every scene except one, and that sole exception
+   (`_sdf_narrowphase`) is now fixed.
 3. ~~Residual warm-graph allocations on hfield~~ — **fixed 2026-08-17**: traced to 7 real
    allocations in `convex_narrowphase` (the EPA polytope scratch + ccd counter, sized from
    `naccdmax`; 11 further calls are zero-sized and allocate nothing). Hoisted into the
@@ -423,6 +426,284 @@ wrong: on franka every wave-aligned override was **slower** (`linesearch_iterati
 `launch_tiled(dim=nworld)` creates one block per world regardless of block size, so raising
 `block_dim` does not fill idle wavefronts -- it assigns more threads to tiles only `nv`
 wide, while reducing blocks resident per CU. Tool: `rocm-tools/blockdim_tune.py`.
+
+### Collision compute is an AMD strength -- except one kernel (2026-08-18)
+
+`aloha_sdf`, `unitree_g1_hfield` and `aloha_clutter` were filed as "collision-dominated"
+because warm capture did not help them. That inference does not hold: warm capture also
+does not help a scene whose cost is the *unrolled solver*, and end-to-end steps/s cannot
+tell the two apart. `rocm-tools/collision_bench.py` measures the collision pipeline on its
+own -- it steps a scene into a representative state, then times `collision(m, d)` in
+isolation and subtracts a run with each narrowphase stubbed out. Same source, same scenes,
+same states, run on both vendors:
+
+| isolated phase, ms/call | MI350X | L40S | L40S / MI350X |
+|---|---|---|---|
+| hfield, whole collision pipeline | 3.469 | 46.944 | **0.074x (AMD 13.5x faster)** |
+| hfield, convex narrowphase (CCD) | 3.189 | 46.564 | **0.068x (AMD 14.6x faster)** |
+| clutter, whole collision pipeline | 1.618 | 3.507 | 0.46x (AMD 2.2x faster) |
+| clutter, convex narrowphase | 0.947 | 2.413 | 0.39x (AMD 2.5x faster) |
+| g1_flat, whole collision pipeline | 0.547 | 0.815 | 0.67x (AMD 1.5x faster) |
+| **aloha_sdf, `_sdf_narrowphase`** | **30.248** | **1.233** | **24.5x (AMD slower)** |
+
+So the CCD/GJK/EPA stack -- the thing wave64 divergence was supposed to punish -- is
+comfortably faster on MI350X, and the broadphase is small either way (AMD is ~3.5x slower
+on the tiny nxn broadphase, 0.19 vs 0.055 ms on hfield: real, but 0.1 ms). Every scene
+except `aloha_sdf` needs to be re-attributed to the solver, not to collision.
+
+The same conclusion from the other direction, using `-o opt.iterations` as a control
+(MI350X, `rocm-tools/slurm/col_iterceil.sbatch`; both scenes configure a **100**-iteration
+budget and converge in 1-3):
+
+| scene | default | iterations=4 | iterations=1 | reading |
+|---|---|---|---|---|
+| aloha_sdf | 38,806 / 38,563 | 36,009 | 29,016 | solver is ~free; **collision is the cost** |
+| aloha_clutter | 87,338 / 86,283 | -- | 126,854 | **1.45x** sits in the unrolled solver |
+
+(Caveat: neither scene replays a control trajectory in this test, so cutting iterations
+changes the physics -- both vendors get *slower* at `iterations=1` because the sim stops
+converging. The same reversal appears on the L40S, so the comparison is still like-for-like;
+just do not read `iterations=1` as a ceiling.)
+
+Where `aloha_sdf`'s time actually goes, from mujoco_warp's own event trace
+(`rocm-tools/etrace_agg.py`, steady-state eager step, MI350X):
+
+| scope | MI350X | L40S |
+|---|---|---|
+| `step` | 34.83 ms | -- |
+| `forward` | 32.68 | 16.11 |
+| `forward.fwd_position.collision.sdf_narrowphase` | **30.25 (87% of the step)** | 1.23 |
+| `...collision.convex_narrowphase` | 0.34 | 1.45 |
+| `...collision.primitive_narrowphase` | 0.04 | 0.05 |
+| `...collision.nxn_broadphase` | 0.06 | 0.03 |
+| `forward.solve` | 1.39 | 12.21 |
+
+One kernel, 87% of the step, 24.5x off the L40S. That is the entire `aloha_sdf` gap. It has
+two causes, and the smaller one is the one that looks like the obvious answer.
+
+**First cause: the kernel had no `__launch_bounds__`.** Without it the HIP compiler must
+assume the maximum flat workgroup size (1024 threads = 16 waves resident on one CU = 4
+waves per SIMD), which caps the kernel at 128 VGPRs. `_sdf_narrowphase` inlines the whole
+gradient-descent / Wolfe line-search / octree-sampling stack into one body and wants far
+more than that, so it spills to scratch. Declaring the true block size lifts the cap.
+Measured on `aloha_sdf` @8192, warm graph, controls interleaved
+(`rocm-tools/slurm/col_sdf_sweep.sbatch`):
+
+| config (block_dim, `__launch_bounds__`) | steps/s |
+|---|---|
+| stock (256, none) -- three controls | 32,955 / 35,779 / 33,630 |
+| **256 + `__launch_bounds__(256, 1)`** | **55,269 (1.61x)** |
+| 128 + `__launch_bounds__(128, 1)` | 33,365 |
+| 64 + `__launch_bounds__(64, 1)` | 35,724 |
+| 512 + `__launch_bounds__(512, 1)` | 33,583 |
+| 256 + `__launch_bounds__(256, **2**)` | 33,551 |
+
+Two things worth reading off this table. The winning row launches at Warp's *default* block
+size, so the only difference from the control is the presence of the attribute -- nothing
+about the launch geometry changed. And on HIP the second `__launch_bounds__` argument is
+MIN_WARPS_PER_EXECUTION_UNIT, so `2` halves the register budget to 256 VGPRs: it erases the
+entire win, which pins the kernel's requirement at **>256 VGPRs** against an implicit cap of
+128. (Same trap as the `_CCD_MIN_BLOCKS=8` finding on the hfield CCD kernel -- NVIDIA's
+min-blocks-per-SM semantics do not carry over.)
+
+The compiled binaries say it outright. Reading the AMDGPU metadata note out of the two
+`.cubin`s Warp cached for this kernel (`rocm-tools/hsaco_regs.py`):
+
+| | stock | `__launch_bounds__(256, 1)` |
+|---|---|---|
+| `max_flat_workgroup_size` | 1024 | 256 |
+| `vgpr_count` | **128** (the cap) | **465** |
+| `agpr_count` | 0 | 209 |
+| **`vgpr_spill_count`** | **465** | **0** |
+| `sgpr_spill_count` | 125 | 95 |
+| `private_segment_fixed_size` (scratch) | 21,088 B | 19,104 B |
+
+465 spilled VGPRs, in the innermost loop of a gradient descent that re-samples an octree
+ten times per iteration. Declaring the bound moves all of them back into registers.
+
+**This generalises past mujoco_warp, and the fix belongs in Warp.** Warp compiles a module
+once per `block_dim` and launches it at exactly that width, so it always knows the bound at
+codegen time and simply never emitted it. `warp/_src/codegen.py` now emits
+`WP_DEFAULT_LAUNCH_BOUNDS` for kernels that declare none; the macro expands to
+`__launch_bounds__(WP_TILE_BLOCK_DIM)` under `__HIPCC__` and to nothing otherwise, so
+NVIDIA codegen is semantically unchanged. A/B'd against **stock, unpatched mujoco_warp**,
+two full passes with a separate kernel cache per variant
+(`rocm-tools/slurm/col_warplb.sbatch`):
+
+| scene, steps/s | off (pass 1 / 2) | on (pass 1 / 2) | ratio |
+|---|---|---|---|
+| aloha_sdf | 39,859 / 39,811 | **56,816 / 56,657** | **1.43x** |
+| aloha_clutter | 88,035 / 86,428 | 85,788 / 86,876 | 0.99x |
+| unitree_g1_hfield | 897,540 / 893,224 | 901,664 / 893,297 | 1.00x |
+
+Pass-to-pass spread is under 2%, so both the sdf gain and the two non-regressions are real,
+and no mujoco_warp change is needed. The fix's reach across the rest of the suite is narrow
+but its downside is nil: of 40 code objects in an `aloha_sdf` kernel cache 8 spill, and
+after `_sdf_narrowphase`'s 465 the next worst are `linesearch_iterative` (10) and
+`primitive_narrowphase` (7). It removes a cliff rather than lifting a floor.
+
+**The bigger half of the kernel's cost is six device `printf`s.** `collision_sdf.py` carries
+six `wp.printf` / `wp.print` error diagnostics inside `find_oct`, `sdf` and `sdf_grad` --
+unreachable-error paths, buried under a deeply inlined call tree. On HIP `printf` lowers to
+an OCKL **hostcall**, which the compiler must treat as an opaque, memory-clobbering call: it
+materialises a varargs buffer at each site and forces live values across it. Six of them
+inside the octree walk is what drives the register demand in the first place. Timing the
+kernel on its own (`collision_bench.py`, isolated `sdf_narrowphase`, ms/call,
+`rocm-tools/slurm/col_sdf_kernel_sweep.sbatch`):
+
+| variant | stock body | prints removed |
+|---|---|---|
+| no `__launch_bounds__` (control x2) | 263.50 / 262.47 | **21.96 / 21.90** |
+| `__launch_bounds__(64)` | 145.68 | 32.67 |
+| `__launch_bounds__(256)` | 154.13 | 38.82 |
+| `__launch_bounds__(512)` | 155.41 | -- |
+| `__launch_bounds__(1024)` | **255.25** | -- |
+| `__launch_bounds__(256, 2)` | 146.90 | -- |
+
+Removing the prints is worth **12.0x on the kernel** -- against the L40S's 16.53 ms for the
+same isolated kernel in the same harness, that moves MI350X from **15.9x slower to 1.33x
+slower**. Repeat controls agree to 0.4%, and the `__launch_bounds__(1024)` row is the
+internal control that pins the mechanism: 1024 *is* the value the compiler already assumed,
+and declaring it explicitly buys nothing.
+
+End to end it is **2.27x on `aloha_sdf`**, with the controls interleaved
+(`rocm-tools/slurm/col_sdf_round4.sbatch`, @8192, 400 steps):
+
+| run | steps/s | `ncon_mean` |
+|---|---|---|
+| stock a / b / c | 40,290 / 50,353 / 45,597 | 16.5138 / 16.5139 / 16.5144 |
+| **prints removed a / b** | **100,753 / 105,486** | 16.5129 / 16.5131 |
+
+`ncon_mean` agrees to five significant figures, and stock-to-stock varies by as much as
+stock-to-patched, so the physics does not move. Two checks say the prints are safe to
+compile out: they **never fire** (an unfiltered 512-world run emits zero `ERROR` lines, so
+the 12x is entirely a compile-time effect and is not hiding a real octree failure), and
+`nacon` after 20 steps differs between two *identical* stock runs by as much as it does
+between stock and patched -- mujoco_warp's SDF scene is run-to-run nondeterministic on ROCm
+at that horizon, which is why the equivalence check has to be made at 1-3 steps against a
+same-horizon control.
+
+The two fixes are not additive, they are alternatives, and the register data says why
+(`rocm-tools/hsaco_regs.py`):
+
+| build | max_flat_wg | vgpr | agpr | vgpr spills | scratch |
+|---|---|---|---|---|---|
+| stock | 1024 | 128 | 0 | **465** | 21,088 |
+| stock + `__launch_bounds__(256)` | 256 | 465 | 209 | 0 | 19,104 |
+| prints removed | 1024 | 128 | 0 | 93 | 8,820 |
+| prints removed + `__launch_bounds__(256)` | 256 | 345 | 89 | 0 | 7,636 |
+
+Once the prints are gone the kernel nearly fits in 128 VGPRs (93 spills), and raising the
+cap then *costs* 1.8x: at 345+89 registers occupancy collapses to about one wave per SIMD,
+and that is worse than paying for 93 cheap spills. So the launch-bounds default is a
+guardrail against the cliff, not a free win everywhere -- worth keeping in mind if a future
+Warp kernel regresses on ROCm.
+
+**Third, smaller lever: the octree descent indexes a register vector dynamically.**
+`find_oct` picks the next child with `oct_child[node][4*z + 2*y + x]`. AMD GPUs have no
+indexed register-file access, so an 8-wide value indexed by a runtime value either goes to
+scratch or becomes a select chain -- inside a 100-iteration pointer-chasing loop that is the
+hottest code in the kernel. Writing the select chain out by hand
+(`rocm-tools/sdf_oct_patch.py`, which also hoists the eight repeated `oct_child[node]` loads
+in the leaf test into one) is worth little while `printf` dominates and becomes visible once
+it does not (`rocm-tools/slurm/col_sdf_round3.sbatch`):
+
+| body | no `__launch_bounds__` | `__launch_bounds__(256)` |
+|---|---|---|
+| stock (drift control x2) | 263.05 / 264.39 | 153.51 / 152.79 |
+| + static octree index | 259.95 (1.2%) | 144.26 (6.0%) |
+| + static octree index, prints removed | **18.84 (14% over prints-removed alone)** | 37.30 |
+
+Stacked, `_sdf_narrowphase` goes **263.0 ms -> 18.84 ms, 14.0x** (see the closing table for
+the L40S comparison). Repeat controls in this job agree to 0.5%, and the four measurements of
+the stock configuration across three independent jobs landed on 263.50 / 262.47 / 263.05 /
+264.39.
+
+So the ranked fix list for the one genuinely AMD-hostile collision kernel is: compile out the
+device prints (12.0x), then the static octree index (a further 1.16x), and `__launch_bounds__`
+only matters if the prints stay.
+
+**Validated in the shape it should be upstreamed** (`rocm-tools/slurm/col_sdf_round5.sbatch`).
+The prints are *guarded*, not deleted -- `rocm-tools/sdf_debugprint_patch.py` wraps each in
+`if _SDF_DEBUG_PRINT:` on a module constant, so Warp emits `if (false)` and the branch dies
+in the first simplification pass while `MJW_SDF_DEBUG_PRINT=1` brings the diagnostics back.
+It measures the same as deleting them:
+
+| | isolated kernel, ms | `aloha_sdf` @8192, steps/s |
+|---|---|---|
+| stock (controls) | 235.48 / 236.35 | 44,439 / 49,557 |
+| guarded prints | 22.05 | 74,179 |
+| **guarded prints + static octree index** | **18.74** | **101,266 / 105,751** |
+
+**2.20x end to end**, from 46,998 to 103,509 steps/s. (The 74,179 for guarded-alone is below
+`round4`'s 100,753 / 105,486 for the same change with the prints deleted; the node was
+contended and that single point should not be read as the guard being worse -- at kernel
+level guarded is 22.05 against deleted's 21.96 / 21.90.)
+
+Correctness, checked against a same-horizon control because the scene is chaotic and ROCm
+run-to-run nondeterministic (`rocm-tools/sdf_equiv.py`, 512 worlds, 1 step):
+
+| field | stock vs stock (control) | patched vs stock |
+|---|---|---|
+| `contact.dist` | 1.104892e-02 | 1.104894e-02 |
+| `contact.pos` | 3.560256e-02 | 3.560257e-02 |
+| `contact.frame` | 6.340905e-01 | 6.340907e-01 |
+| `contact.geom` / `nacon` | 0 | 0 |
+| `qpos` | 9.08e-09 | 1.55e-07 |
+| `qvel` | 9.08e-06 | 1.55e-04 |
+
+The contact arrays differ from stock by *the same amount two identical stock runs differ*:
+contacts are appended in nondeterministic order (the `worldid` column permutes by ~500
+either way), so those columns measure ordering, not physics. `nacon` and the geom pairing
+are exact. State drift after one step is 1.6e-7 in `qpos` -- about 17x the run-to-run floor,
+which is what changing register pressure and FMA contraction does to a chaotic contact
+solve, not a semantic change.
+
+Both test suites, each with its control run in the same job: the **Warp suite is 8,294 tests,
+`OK (skipped=240)`** with the codegen change on and off
+(`rocm-tools/slurm/col_validate_warp.sbatch`), and the **mujoco_warp suite is 1,233 passed /
+30 skipped** with the SDF fixes and without (`rocm-tools/slurm/col_validate_mjw.sbatch`) --
+both identical to the branch baseline. (The patched mujoco_warp run took 109 s against the
+stock run's 886 s. That is the JIT-cache warming artifact documented above, *not* a speedup;
+the two runs shared a kernel cache and the second inherited it.)
+
+**Both mujoco_warp fixes are upstream candidates, not ROCm workarounds.** The same patched
+source on an L40S (`rocm-tools/slurm/col_sdf_nv_ab.sbatch`) is slightly *faster*, never
+slower:
+
+| L40S | stock a | patched | stock b |
+|---|---|---|---|
+| isolated `_sdf_narrowphase`, ms | 16.452 | **16.048** | 16.490 |
+| `aloha_sdf` @8192, steps/s | 398,803 | **405,298** | 398,240 |
+
++2.5% on the kernel and +1.6% end to end on CUDA. Which closes the loop on the whole
+investigation:
+
+| `_sdf_narrowphase`, isolated | MI350X | L40S | ratio |
+|---|---|---|---|
+| stock | 235.5 - 263.5 | 16.45 | **14.3 - 16.0x** |
+| patched | **18.74** | 16.05 | **1.17x** |
+
+`aloha_sdf` end to end goes from **8.48x behind the L40S to 3.92x**. The remaining 3.9x is
+**not attributed yet** -- the kernel that used to be 87% of the step is now within 17% of the
+L40S in the isolated harness, so whatever dominates the benchmark's (heavier, more-contact)
+state is something else. Redo the phase split on the patched build before guessing; the
+`opt.iterations` control is the obvious first suspect, since this scene budgets 100 solver
+iterations with an elliptic cone and converges in ~3, and that control was previously
+meaningless here only because collision swamped it.
+
+**Next lead, unexplored:** mujoco_warp has **28 device prints** in total, and the file with
+the most is `collision_flex.py` (**9**) -- the cloth family, which is separately known to be
+among the worst-performing scenes on this branch. `smooth.py` (2), `forward.py` (4) and
+`collision_convex.py` (3) are also worth an A/B. Anyone picking this up: apply
+`rocm-tools/sdf_debugprint_patch.py`'s guard pattern to the file, then time with
+`rocm-tools/collision_bench.py` and read `vgpr_spill_count` with
+`rocm-tools/hsaco_regs.py` -- a spill count in the hundreds under
+`max_flat_workgroup_size: 1024` is the signature.
+
+Also refuted this round: `rocprofv3 --kernel-trace` is unusable on a captured mujoco_warp
+run -- it hangs on `aloha_sdf` and segfaults with `--output-format csv` (matching the known
+`--stats` hang). Use `collision_bench.py` / the event trace instead.
 
 ### Optimization round findings (2026-08-15)
 
@@ -497,7 +778,11 @@ covers, in value order: (1) hipGraph **conditional node** support, worth a measu
 on franka / 3.38x on humanoid; (2) graph **allocation nodes replay ~20x worse than CUDA**
 (2.20x vs 1.06x cold/warm penalty); (3) the **stuck invalidated capture** bug, already
 fixed on clr `develop` as `fa77aed` but unreleased — ask for a 7.2.x backport;
-(4) minor CUDA-semantics divergences. Original working notes below.
+(4) a **compiler bug — an unreachable device `printf` costs 12x** by spilling 465 VGPRs
+across the whole kernel, plus the 128-VGPR cap on kernels with no `__launch_bounds__`;
+(5) **`rocprofv3` hangs or segfaults** on captured mujoco_warp runs, so there is no
+kernel-level profiler for this workload; (6) minor CUDA-semantics divergences.
+Original working notes below.
 
 ### Original working notes
 
@@ -566,7 +851,7 @@ zhihuidu-amd/hipgraph-ms), `sort_check.py` (segmented sort correctness), `flex_c
 
 AMD actively develops the port (AMD-Ecosystem/warp) and reviews outside fixes; NVIDIA merges
 portability-neutral fixes (see nvidia/warp PR #1702). `rocm-117` sits on AMD's
-`amd-integeration-dev` (~17 commits behind nvidia/warp main as of 2026-08-13) — the 430-commit
+`amd-integration-dev` (~17 commits behind nvidia/warp main as of 2026-08-13) — the 430-commit
 sync gap is closed. Our fix stack on top (~10 commits) is all upstream candidates: the
 `CUDA_CALLABLE` annotations and the cluster arch-string fix are NVIDIA-neutral
 (nvidia/warp); capture enablement, the alloc guard, capture-safe LBVH rebuild, kernel-only

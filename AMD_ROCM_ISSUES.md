@@ -106,7 +106,62 @@ the process.
 
 ---
 
-## 4. Minor divergences from CUDA semantics
+## 4. Compiler bug: an unreachable device `printf` costs 12x on the hot path
+
+**What happens**: a `printf` on a never-executed error branch inflates register pressure
+across the *whole* kernel badly enough to dominate its runtime. This is not a small
+constant: on a real workload it is a **12.0x** end-to-end kernel regression, and it is
+invisible to the author because the call never runs.
+
+**Repro**: mujoco_warp's `collision_sdf.py` `_sdf_narrowphase` (a gradient descent with a
+Wolfe line search over an octree-sampled SDF) carries six `printf` diagnostics on
+"impossible" paths — invalid octree node, node not found, unimplemented SDF type. An
+unfiltered 8192-world run emits **zero** of them; they are genuinely dead. Deleting the six
+calls and changing nothing else, on gfx950 / ROCm 7.2 / hipRTC:
+
+| | six `printf`s present | removed |
+|---|---|---|
+| isolated kernel time (ms/call) | 263.5 / 262.5 (two runs) | **21.96 / 21.90** |
+| `vgpr_count` | 128 (the implicit cap) | 128 |
+| **`vgpr_spill_count`** | **465** | **93** |
+| `sgpr_spill_count` | 125 | 0 |
+| `private_segment_fixed_size` | 21,088 B | 8,820 B |
+| whole-benchmark throughput | 45,413 steps/s | **103,120 steps/s (2.27x)** |
+
+**Read**: on HIP `printf` lowers to an OCKL hostcall, which the optimizer must treat as an
+opaque, memory-clobbering call with a varargs buffer. Six of them scattered through a deeply
+inlined call tree keep values live across the whole body, and the register allocator then
+spills 465 VGPRs in the innermost loop. We would expect the compiler to sink or outline a
+call on a cold, side-effect-only path so it does not price the hot path — this is what the
+NVIDIA toolchain effectively does: the same source on an L40S runs the kernel in 16.5 ms
+with the prints present.
+
+**Why it matters beyond us**: nothing warns the author. The code looks like defensive
+error handling, costs nothing on NVIDIA, and silently makes the ROCm build an order of
+magnitude slower. Any GPU codebase that logs from device error paths is exposed. Tooling
+would help too — this was only diagnosable by reading `vgpr_spill_count` out of the cached
+code object by hand (`rocm-tools/hsaco_regs.py`), because `rocprofv3 --kernel-trace` hangs
+or segfaults on these runs (see item 5).
+
+Related, and cheaper for AMD to fix: **kernels compiled without `__launch_bounds__` are
+capped at 128 VGPRs** because the compiler must assume a 1024-thread workgroup. That is
+correct but unhelpfully conservative for a JIT front end that knows the launch width;
+declaring it recovers 1.71x on the same kernel. We fixed this in Warp's code generation, but
+a diagnostic ("kernel spills N VGPRs; consider `__launch_bounds__`") would have saved days.
+
+---
+
+## 5. Tooling bug: `rocprofv3` is unusable on captured mujoco_warp runs
+
+`rocprofv3 --stats` hangs (previously reported), and so does `--kernel-trace` on
+`aloha_sdf`; with `--kernel-trace --output-format csv` the process **segfaults** and writes
+no output directory at all. This is on the same runs that execute correctly without the
+profiler. It left us with no kernel-level profiler on ROCm for this workload — every number
+in items 4 and 5 had to be obtained by differential timing from the application side.
+
+---
+
+## 6. Minor divergences from CUDA semantics
 
 Lower priority, but each cost us debugging time and forced a workaround:
 
