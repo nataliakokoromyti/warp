@@ -1297,8 +1297,7 @@ cuda_test_devices = get_selected_cuda_test_devices()
 cuda_test_devices_with_mempool = get_selected_cuda_test_devices_with_mempool()
 
 # Graph-capture tests require a device where capture is a real (deferred)
-# operation. Capture is a no-op on HIP/ROCm (Device.supports_graph_capture is
-# False), so filter to devices that actually support it.
+# operation, so filter on the capability rather than the backend.
 graph_capture_test_devices = [d for d in cuda_test_devices_with_mempool if d.supports_graph_capture]
 
 

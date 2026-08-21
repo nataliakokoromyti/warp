@@ -620,8 +620,8 @@ def test_hashgrid_saveable_capture_unsupported(test, device):
     """Report saveable capture as unsupported pending HashGrid serialization."""
     if not wp.get_device(device).supports_graph_capture:
         # The saveable-capture guard is only reached while a capture is active.
-        # On devices without native graph capture (e.g. HIP/ROCm) ScopedCapture
-        # is a no-op, so grid.build() never hits that path -- nothing to assert.
+        # On devices without native graph capture ScopedCapture is a no-op, so
+        # grid.build() never hits that path -- nothing to assert.
         test.skipTest("Native graph capture is unsupported on this device")
 
     points = wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device)

@@ -16,7 +16,10 @@ HIP graph-capture PR #15 + our fixes; fully validated but frozen. Full backgroun
 
 ## Current state — what's proven (rocm-117, MI350X / ROCm 7.2.0, bare-metal)
 
-- **Warp full test suite: 8,294 tests, 0 failures / 0 errors** (240 principled skips).
+- **Warp full test suite: 8,294 tests, 0 failures / 0 errors** (240 principled skips) --
+  but see "The two intermittent suite failures" below: repeating the suite trips a real
+  MI350X data-corruption bug in ~60% of runs, so a single green run is weak evidence.
+  Do not quote a lone green suite as proof.
 - **google-deepmind/mujoco_warp main: 1,233 passed / 0 failed / 30 skips** — now
   **including all render tests**: CDNA software-sampled texture fallback works, where the
   1.13 branch disabled rendering entirely. (Needs `patches/mujoco_warp-rocm-compat.patch`.)
@@ -26,6 +29,8 @@ HIP graph-capture PR #15 + our fixes; fully validated but frozen. Full backgroun
 - **Full benchmark suite re-run on 1.17 with warm capture** (2026-08-17): g1_flat 1.51M
   steps/s, franka 5.08M, humanoid 1.40M — see the cross-vendor section for the full table
   and for why the previously reported gaps were mostly a cold-capture artifact.
+- **Every benchmark scene now runs** (2026-08-18): `primitives`, the last AMD-only failure,
+  was an oversized launch and is fixed — 313,893 steps/s.
 
 ## Our fixes (each upstreamable; see git log)
 
@@ -49,6 +54,13 @@ NVIDIA-only features (PTX inspection, clusters, IPC event flags, in-graph event 
 stream-priority timing) and FP-tolerance relaxations in the gfx950 style AMD established.
 Obsolete on 1.17: the `grid_stride` shim (native ≥1.15) and the rocWMMA `block_dim != 64`
 fallback (the new base has no rocWMMA path at all).
+
+Added 2026-08-18 (robustness pass, all in `warp.cu`): **clamp oversized grid-stride
+launches** instead of rejecting them, so a launch past HSA's uint32 per-dimension ceiling
+runs (this is what makes `primitives` work -- see below); **order in-capture frees after
+every use of the allocation**, which removes a GPU memory fault when an allocation is used
+on a side stream inside a capture; and **report the recorded free node on HIP** so the graph
+topology tests can run at all.
 
 mujoco_warp (`patches/mujoco_warp-rocm-compat.patch`): texture-less rendering auto-disable;
 `graph_conditional` gated on `wp.is_conditional_graph_supported()`; HIP-aware toolkit check;
@@ -396,8 +408,6 @@ upstream.
 `aloha_cloth`) overflows on the **L40S too** (22/31/31 worlds vs our 26/29/29) with the
 same assets and settings. The old handoff item claiming AMD uniquely needs `nconmax~26000`
 was wrong -- this is a mujoco_warp/scene-config issue, not a ROCm accounting difference.
-`primitives` runs on the L40S (1.19M steps/s) but still fails on AMD -- that one *is*
-ours to triage.
 
 Where the remaining gap actually lives, now that allocation noise is gone:
 
@@ -722,9 +732,295 @@ run -- it hangs on `aloha_sdf` and segfaults with `--output-format csv` (matchin
   decorator argument — changing it silently reuses the old binary. Worth an upstream fix
   (nvidia/warp); we hash-bust with source comments in the compat patch meanwhile.
 - **Intermittent watch**: two different single-test suite failures across runs
-  (`test_copy_i2c_...Graph...`, `test_implicit_fields`), both exact-value partial-write
-  signatures, each passing in other runs (suite is otherwise 8,294-green). Needs a
-  dedicated flake-hunt (run those classes ~50×) before trusting or chasing.
+  (`test_copy_i2c_...Graph...`, `test_implicit_fields`) — **superseded**, see "The two
+  intermittent suite failures" above for the recovered signatures and the flake hunt.
+
+## `primitives` benchmark -- root-caused and fixed (2026-08-18)
+
+`primitives` was the last AMD-only benchmark failure (it runs on an L40S at 1.19M
+steps/s). It is not a physics or rendering problem: mujoco_warp's Newton solver launches
+
+```python
+wp.launch(_update_gradient_init_h_sparse(sc), dim=(d.nworld, m.nv_pad, m.nv_pad), ...)
+```
+
+and `primitives` runs `nworld=8192` with `nv_pad` in the high hundreds --
+`8192 x 768 x 768 = 4,831,838,208` threads, past `UINT32_MAX`. **HSA encodes each
+dispatch dimension's global work size as a uint32**, so `gridDim.x * blockDim.x` cannot
+exceed `2**32`; `wp_cuda_launch_kernel` rejected the launch up front (the guard exists
+because HIP does *not* reject it -- it dispatches and faults with a sticky launch failure
+that poisons the context). CUDA has no such ceiling, which is the entire vendor
+difference. Verified directly: the same launch shape counts correctly on an L40S
+(`rocm-tools/big_launch.py`).
+
+**Fix** (`warp/native/warp.cu`): the blanket `dim > UINT32_MAX` rejection is only correct
+for *lean* kernels, which map one thread per work item. A **grid-stride** kernel (Warp's
+default) loops over the full extent, so the grid size carries no semantics and clamping
+`grid_x` to `UINT32_MAX / block_dim` covers exactly the same work items. The guard now
+clamps for grid-stride launches and only rejects lean ones. This also un-gates
+`test_large.py`'s two `not d.is_hip` tests, which launch 2**33 and ~5.5e11 threads
+through grid-stride kernels -- and those tests check exact per-work-item counts, so they
+verify the clamped path covers every element.
+
+Tool: `rocm-tools/big_launch.py` (oversized 3D and 1D launches plus a
+context-still-usable check).
+
+**Validated** against a build with the fix (`rocm-tools/slurm/robust_build.sbatch`):
+`big_launch.py` counts the 4.83e9-thread 3D launch and a 2**32+12,345 1D launch exactly and
+leaves the context usable; un-gated `test_large.py` passes **17/17** on HIP; and
+**`primitives` now runs on MI350X at 313,893 steps/s** (L40S 1.19M). A full Warp suite run
+on the same build shows no regressions -- 8,294 tests with three failures, one being the
+MI350X corruption bug documented above and two being a missing `Pillow` in the isolated
+build venv.
+
+## The two intermittent suite failures -- SOLVED (2026-08-18)
+
+**Answer first: on MI350X under multi-process load, a kernel writing to a `hipMalloc`ed
+buffer can leave exactly one of the eight round-robin XCD classes of workgroups with no
+visible output.** No error is raised, and a full device synchronize does not repair it.
+Memory from `hipMallocAsync` is immune, which is why ordinary Warp and mujoco_warp code --
+`rocm-117` enables memory pools by default -- is **not** exposed. The failing tests are the
+ones that deliberately disable pools to exercise the default allocator.
+
+Filed as issue 0 in `AMD_ROCM_ISSUES.md`. **Do not disable memory pools on a shared
+MI350X.**
+
+### Minimal reproduction
+
+`rocm-tools/block_dropout.py --no-mempool`, eight concurrent processes: `hipMalloc` ~4 MB,
+launch a kernel writing `1.0` to every element, synchronize, read back, look for zeros.
+No copies, no graphs, no streams, no host transfers. **3 of 8 processes hit it**, about
+once per 4,000 iterations each; with pools enabled, 0 of 8.
+
+```
+DROPPED iter 474: {'bad_elems': 124992, 'bad_blocks': 489, 'total_blocks': 3907,
+                   'whole_blocks_missing': True, 'block_residues_mod8': [2],
+                   'first_blocks': [2, 10, 18, 26, 34, 42],
+                   'all_zero': True, 'repaired_by_reread': False}
+```
+
+Every missing block shares **one residue mod 8** (2 here; 1, 4, 5 and 7 in other hits).
+In SPX mode workgroups round-robin across the 8 XCDs, so that is one XCD's entire share.
+
+### The two measurements that pin it down
+
+**1. The allocator decides.** Same workload, 8 concurrent processes x 1,500 iterations,
+only the allocation path changed (`copy_repro.py --mempool ...`):
+
+| memory pool during the copy | processes hitting corruption |
+|---|---|
+| `off` -- `hipMalloc` | **2 / 8** (one process 7 hits in 1,500) |
+| `template` -- what the test does, which collapses to disabled | 1 / 8 |
+| `on` -- `hipMallocAsync` | **0 / 8** |
+| `none` -- no scoping, Warp's default, pools enabled | **0 / 8** |
+
+**2. The unit of loss is the thread block, not a byte range.** At 256 floats per block one
+block is exactly 1 KB, which is also the damage granularity, so those two readings were
+indistinguishable. Varying `block_dim` separates them:
+
+| `block_dim` | run length | run stride | elements lost (of 1,000,000) |
+|---|---|---|---|
+| 64 | **256 B** | **2 KB** | 124,992 |
+| 256 | **1 KB** | **8 KB** | 124,928 / 125,184 |
+| 1024 | **4 KB** | **32 KB** | 124,928 |
+
+Run length is exactly `block_dim x 4` and stride exactly `8 x block_dim x 4` at every block
+size, while the fraction lost stays 1/8. A DMA or scrub chunking bug would have held a fixed
+byte lattice.
+
+**Most likely mechanism** (a reading, not a measurement): a fresh `hipMalloc` establishes a
+new virtual-to-physical mapping and, under contention, one XCD's TLB/L2 is not updated for
+it -- so that XCD's workgroups write somewhere stale while the readback sees the correct
+pages still holding their scrubbed zeros. Consistent with pool allocations being immune
+(they reuse existing mappings), with the surviving values always being exactly `0.0`, and
+with a device synchronize not helping.
+
+### How the failures presented, and the trail
+
+Recovered from the archived suite logs and from repeated suite runs. **3 failing runs
+(4 failing tests) in 5 full-suite runs** (`rocm-tools/slurm/flake_hunt.sbatch`) -- roughly a
+60% chance per run, so a single green suite is close to no evidence.
+
+| run | test | mismatched |
+|---|---|---|
+| archive `16811062` | `test_copy_i2c_d2d_...Stream0_NoGrad_Graph_AccessDstSrc` | 125,184 / 1,000,000 |
+| archive `16812542` | `test_implicit_fields` | 3 / 9 |
+| hunt run 3 | `test_copy_i2c_d2d_...NoStream_NoGrad_NoGraph_AccessBoth` | 124,992 / 1,000,000 |
+| hunt run 4 | `test_copy_i2fi_d2h_...NoStream_NoGrad_NoGraph_AccessNone` | 124,928 / 1,000,000 |
+| hunt run 5 | `test_copy_fi2fi_d2d_...Stream0_NoGrad_Graph_AccessNone` | 125,184 / 1,000,000, zeros on the **`src`** side |
+| hunt run 5 | `test_implicit_fields` (second failure, same run) | 3 / 9 |
+
+Two observations turned the investigation. Run 5's zeros were on `src.numpy()`, not on the
+array the test was writing -- so the damage follows whichever buffer a kernel last wrote,
+not the operation under test. And runs 3 and 4 used **no graph and no explicit stream**,
+which removed every cross-stream construct that could be mis-ordered.
+
+**Everything ordering-shaped was tested and is clean** -- all on MI350X with matching L40S
+controls: captured cross-stream fork/join ordering (`capture_fork_join.py`, 20/20, a 27 ms
+forked kernel blocks `synchronize_stream` for the full 27 ms); null-stream implicit ordering
+across 7 shapes including unsynchronized graph replay (`null_stream_sync.py`, 0 torn reads
+in 25 trials per shape plus 1,600 stress iterations); and the literal failing configuration
+plus all 32 copy variants (`copy_repro.py`, 0 in 6,000 and 0 in 6,400).
+
+**Single-process probes never reproduce it**, no matter the shape: ~110,000 readbacks
+across static buffers, pinned destinations, background GPU load, and 20,000 iterations of
+fresh-pool-buffer churn. The missing variable was **process-level concurrency** -- the suite
+runner puts ~16 test classes in parallel processes on one GPU. Eight concurrent
+`copy_repro.py` processes reproduce it in 5-7 of 8, which is what turned a suite-only flake
+into a 30-second standalone repro.
+
+Lesson worth keeping: the first four probes were all clean because they tested the wrong
+axis *and* ran three orders of magnitude too few iterations. Describing the damage
+structurally (runs, stride, residues) rather than counting mismatched elements is what
+actually broke it open.
+
+## Test-gate audit (2026-08-18)
+
+Every "green" suite result is only as good as what it still runs. The 240 suite skips on
+MI350X break down as follows -- 140 are `add_function_test` device lists that filter HIP
+out entirely, the rest are ordinary capability skips shared with CUDA.
+
+**Counting caveat**: a device filter only produces a visible *"No suitable devices to run
+the test"* skip when it empties the list. A test registered for `[cpu, cuda:0]` that
+becomes `[cpu]` on HIP still runs -- on the CPU -- and reports nothing, so its GPU coverage
+disappears silently. `test_graph.py` loses ~11 more tests that way on top of the 20 counted
+below. Read the numbers as a lower bound.
+
+| suite | HIP-skipped | verdict |
+|---|---|---|
+| `deterministic/*` (4 modules) | 76 | genuine; the deterministic subsystem is unported (see below) |
+| `test_graph.py` | 20 (plus ~11 silent) | **hides a hard GPU crash -- see below** |
+| `cuda/test_texture.py` | 19 | genuine (CDNA has no texture hardware; the CPU sampling fallback is covered separately) |
+| `cuda/test_cluster_dim.py` | 8 | genuine (no thread block clusters) |
+| `cuda/test_clang_cuda.py` | 7 | genuine (emits PTX/CUDA that cannot load on gfx) |
+| `cuda/test_streams.py` | 3 | 2 genuine HIP limitations (in-graph event timing, external event nodes), 1 timing-flaky (stream priority) |
+| `test_large.py` | 2 | **gate removed** -- the grid-stride clamp lets both run; 17/17 pass on HIP |
+| `test_fast_math.py` | 2 | genuine (fast-math `powf(-2,2)` divergence, PTX inspection) |
+| `cuda/test_ipc.py` | 2 | gate is correct, reason was not -- see below |
+| `test_bf16.py` | 1 | needs two devices |
+
+### `test_graph.py`: the gate was hiding a GPU memory fault -- now fixed (2026-08-18)
+
+The exclusion reads *"HIP/ROCm does not support native CUDA graph capture"*. It was
+inherited from AMD's base, where capture was disabled; `rocm-117` enables capture, so the
+comment is simply false and 20 tests stop running in the area this port changed most.
+
+Removing it and running the file on MI350X:
+
+```
+test_cuda_graph_alloc_free_preserves_merged_frontier_cuda_0 ... ok
+test_cuda_graph_alloc_transient_stream_cuda_0 ... Memory access fault by GPU node-2
+    (Agent handle: 0x3d950a40) on address 0xf9aee82c000. Reason: Unknown.
+```
+
+`test_cuda_graph_alloc_transient_stream` allocates inside a capture on a *temporary* side
+stream, lets one array go out of scope so it is freed inside the capture, and then checks
+the results. Its own comment states the hazard it exists to catch:
+
+> Array `b` goes out of scope here and is freed. If the free runs on an incorrect stream,
+> the memory could be released prematurely. Other streams that are allocating memory could
+> then reuse the memory while it is still used on this stream, leading to data corruption.
+
+On MI350X it does not merely corrupt -- it faults the GPU. **This is a real bug the gate
+was hiding**, and it is independent of the workgroup-loss bug above: that one needs
+`hipMalloc` plus multi-process contention, this one is a single-process capture fault.
+
+**Decomposed** with `rocm-tools/graph_alloc_fault.py` (one process per case, since a fault
+kills the process). Each case begins a capture and allocates inside it:
+
+| case | result |
+|---|---|
+| allocate on a temp side stream, **no free** | OK |
+| allocate on a temp side stream **and free** | **GPU_FAULT** |
+| same, but `wp.empty` so **no capture-time fill kernels** run | **GPU_FAULT** |
+| same, but on the **device's own stream** instead of a temp stream | OK |
+| same temp stream, **1/1024th the buffer size** | OK |
+
+So the fault needs three things together: an in-capture free, an allocation used on a
+*side* stream, and a buffer big enough for the race to open. It is **not** caused by the
+port's kernel-only capture (the no-fill case still faults), and it disappears entirely when
+the allocation stays on the capture stream.
+
+**Root cause** (`warp/native/warp.cu`, `wp_free_device_async`, the graph-alloc branch).
+The two backends order an in-capture free very differently:
+
+- **CUDA**: `cudaGraphAddMemFreeNode(&free_node, graph, alloc_leaf_nodes, ...)` where
+  `alloc_leaf_nodes` is *every leaf node descended from the alloc node*. The free is
+  therefore ordered after **all** uses of the allocation, on **any** stream in the capture.
+- **HIP**: `hipGraphAddMemFreeNode` rejects pointers that came from `hipMallocAsync` during
+  stream capture, so the port substitutes `hipFreeAsync(ptr, capture->stream)` and lets
+  capture record it. That orders the free after the **capture stream's frontier only**.
+
+An allocation used on a *side* stream inside the capture therefore has no edge from its
+kernels to the free node -- and `wp.ScopedStream` defaults to `sync_exit=False`, so leaving
+the side-stream block does not join it back either. At replay the memory can be unmapped
+while those kernels are still reading it, which is the fault. This is a gap in **our HIP
+branch**, not (necessarily) a ROCm bug.
+
+**Fix**: `hipStreamUpdateCaptureDependencies(capture_stream, alloc_leaf_nodes, n,
+hipStreamAddCaptureDependencies)` immediately before the `hipFreeAsync`. Warp already
+computes `alloc_leaf_nodes` via `get_dependent_leaf_nodes(alloc_info.node, ...)` for the
+CUDA path, and already binds `hipStreamUpdateCaptureDependencies`, so the recorded free
+node inherits exactly the dependencies `cudaGraphAddMemFreeNode` would have been given.
+Adding (not setting) keeps the capture stream's own frontier as a dependency. If the
+allocation node was never found (`alloc_info.node == NULL`, already a warned-about case)
+the ordering cannot be reconstructed and the code now says so explicitly.
+
+`rocm-tools/graph_alloc_fault.py` decomposes the test (temp stream vs device stream, with
+and without capture-time fills, large vs small) so the fix can be checked against the exact
+ingredient that faults.
+
+Related, and worth checking in the same pass: the deferred/eager free paths order the free
+against the allocating stream using that stream's single reusable `cached_event`
+(lines ~647 and ~1070). If the allocating stream has been destroyed, `get_stream_info`
+returns NULL and the dependency is silently skipped.
+
+L40S control, same file un-gated, stock Warp 1.16, one process per test: **27 PASS / 0 FAIL
+/ 0 CRASH / 4 SKIP**, including all 16 alloc/free graph-topology tests and the transient-
+stream test. So these tests are all meant to pass and the fault is HIP-side.
+
+**Validated.** With the fix built, `rocm-tools/graph_alloc_fault.py` is clean in every case
+(`alloc_free`, `alloc_free_nofill` and `full` all went from GPU_FAULT to OK), and the
+un-gated `test_graph.py` run per-process gives **16 PASS / 10 FAIL / 0 CRASH / 5 SKIP** --
+no crash anywhere, and `test_cuda_graph_alloc_transient_stream` itself passes.
+
+The 10 remaining failures were all `RuntimeError: Failed to insert free node`, which is a
+*second*, unrelated gap: `wp_cuda_graph_insert_free_node` returns whatever
+`wp_free_device_async` reports through `dbg_node_ret`, and the HIP branch never set it, so
+every topology test that frees inside a capture failed before testing anything. Fixed by
+reading the node back from the capture stream's frontier (capture sets it to the recorded
+free). Re-run the sweep to confirm; if those ten then pass, the whole `test_graph.py`
+exclusion can be lifted.
+**Do not re-enable the suite until the fault is fixed** -- a crash aborts the whole test
+process. But do not leave the gate labelled "capture unsupported" either; it is now
+labelled as covering a known fault.
+
+The two IPC tests were re-run with the gate removed: both genuinely fail on MI350X.
+`hipIpcOpenMemHandle` returns `hipErrorInvalidValue` for a handle exported by another
+process and the peer's write is not visible (84.0 read where 168.0 was expected);
+`hipIpcGetEventHandle` returns `hipErrorInvalidConfiguration` where CUDA succeeds. So the
+gate stays, but it was hiding a *known-broken* feature behind an "unvalidated" comment --
+now stated as a measured failure in the test file and in `AMD_ROCM_ISSUES.md`.
+
+Two other classes of gate were checked and cleared:
+
+- **Dynamic gates** in `test_sparse.py`, `test_array.py`, `geometry/test_hash_grid.py` and
+  `cuda/test_async.py` filter on `Device.supports_graph_capture`, which is now `True` on
+  HIP, so they *do* run there -- only their comments still claimed otherwise. Comments
+  corrected; no coverage was lost. (This is also why the async-copy `_Graph` variants run
+  on HIP at all.)
+- **The central skip-on-HIP hook** (`_HIP_UNSUPPORTED_ERROR_MARKERS` in
+  `unittest_utils.py`) converts a matching *runtime error* into a skip. It carried two
+  over-broad capture markers: `"native graph capture is unsupported"` (no raising site
+  left) and `"Graph capture is not active on this stream"` (a genuine capture-state error
+  that must fail loudly). Both removed; measured effect on the suite is zero (only the
+  conditional-graph-node marker ever fired).
+
+FP-tolerance relaxations were reviewed and are all narrow and justified: gfx `powf`
+differs from NVIDIA's by ~1e-6 (`test_map.py` rtol 5e-6, `test_codegen.py` 4 places),
+backward accumulation by ~1e-6 (`test_grad.py` tol 1e-4 on values of magnitude 10-40).
+The `test_atomic_cas.py` spinlock exclusion is a correct hardware fact -- CDNA wavefronts
+share an execution mask, so a GPU-wide spinlock built on `atomic_cas` deadlocks.
 
 ## Known issues on HIP (gated in tests, documented here)
 
@@ -764,8 +1060,18 @@ run -- it hangs on `aloha_sdf` and segfaults with `--output-format csv` (matchin
   separately-launched graphs (`test_event_external` gated).
 - **Conditional graph nodes unsupported** (`is_conditional_graph_supported()` False);
   captured solver loops run fixed iteration counts.
+- **In-capture free on a temporary side stream faults the GPU** (found 2026-08-18):
+  `test_cuda_graph_alloc_transient_stream` aborts with "Memory access fault by GPU node-2".
+  The whole `test_graph.py` suite stays gated because the fault kills the test process.
+  **This is the highest-priority open correctness item** -- see the gate-audit section.
+- **Cross-process IPC does not work**: `hipIpcOpenMemHandle` rejects a peer handle and the
+  peer's write is not visible; `hipIpcGetEventHandle` returns an error where CUDA succeeds.
+  Both `test_ipc` cross-process tests gated.
 - **Device-side abort loses printf output**: gfx950 HSA queue aborts (intentional traps,
   OOB asserts) fire before device printf flushes; tests accept the HSA error signature.
+- **A single launch cannot exceed `UINT32_MAX` threads per dispatch dimension** (HSA
+  encoding). Grid-stride kernels now clamp the grid and run correctly; lean kernels are
+  rejected cleanly. See the `primitives` section.
 - ~~Cloth benchmarks need `nconmax≈26000` vs the NVIDIA-tuned 2,200~~ — **retired
   2026-08-17**: the same overflow reproduces on an NVIDIA L40S with identical assets and
   settings, so it is not an AMD accounting difference. Upstream/scene issue.
@@ -781,8 +1087,9 @@ fixed on clr `develop` as `fa77aed` but unreleased — ask for a 7.2.x backport;
 (4) a **compiler bug — an unreachable device `printf` costs 12x** by spilling 465 VGPRs
 across the whole kernel, plus the 128-VGPR cap on kernels with no `__launch_bounds__`;
 (5) **`rocprofv3` hangs or segfaults** on captured mujoco_warp runs, so there is no
-kernel-level profiler for this workload; (6) minor CUDA-semantics divergences.
-Original working notes below.
+kernel-level profiler for this workload; (6) the **in-capture free GPU fault** (open,
+ownership unresolved); (7) minor CUDA-semantics divergences, now including the HSA uint32
+dispatch ceiling and cross-process IPC. Original working notes below.
 
 ### Original working notes
 
@@ -817,6 +1124,11 @@ Original working notes below.
   with no C++ headers. The job templates in `rocm-tools/slurm/` handle it
   (`HIPCC_COMPILE_FLAGS_APPEND=--gcc-install-dir=.../13`). An admin install of
   `libstdc++-14-dev` would obsolete this.
+- **Budget 45-60 min for a native build**, not the ~5 min the NVIDIA docs suggest.
+  `warp/native/reduce.cu` alone takes 30+ minutes under `clang -O3 --offload-arch=gfx950`
+  (single-threaded, and the node is usually running other people's jobs). Never rebuild in
+  the shared `/matx/u/$USER/warp-rocm` tree while others are running against it — clone
+  first (`rocm-tools/slurm/robust_build.sbatch` does).
 
 ## Quickstart
 
@@ -839,13 +1151,38 @@ per process; speedup vs a monolithic warm graph, plus a trajectory check against
 `mjw.step` with a nondeterminism control). `STEPPER_FORCE=1` unrolls the solver loop and
 requires the split, which is how the decomposition is validated on CUDA. Job templates:
 `rocm-tools/slurm/stepper_{amd,nv}.sbatch`.
+### Validation gate
+
+There is no ROCm CI runner, so validation is a single job rather than a pipeline:
+
+```bash
+sbatch rocm-tools/slurm/validate.sbatch          # build + both suites + flake watch + benchmarks
+VALIDATE_QUICK=1 sbatch .../validate.sbatch      # skip benchmarks
+
+sbatch rocm-tools/slurm/robust_probes.sbatch     # the whole robustness probe battery
+sbatch rocm-tools/slurm/robust_nv.sbatch         # the same probes on an L40S, as a control
+sbatch rocm-tools/slurm/flake_hunt.sbatch        # N full-suite runs, dumping every failure
+sbatch rocm-tools/slurm/robust_build.sbatch      # build an isolated clone (PATCH=... optional)
+```
+
+It builds Warp, runs the Warp and mujoco_warp suites, repeats the historically flaky test
+classes five times, smoke-tests the benchmark suite, and ends with a greppable
+`### GATE <name> PASS|FAIL` block plus `OVERALL PASS|FAIL`. `WARP_DIR`/`MJW_DIR` override
+which trees it validates. Run it before declaring a rebase or a port change green; the port
+will otherwise rot silently as mujoco_warp main moves.
+
 
 `rocm-tools/` also has the diagnostics used in this effort: `graph_overhead.py` (graph replay
 cost vs node count), `graph_census.py` (node-type census of a captured step graph),
 `alloc_trace.py` (which allocations fire during capture, with call sites), `g1_msgraph.py`
 (single- vs multi-stream capture on G1@256; needs `hipgraph_ms.py` fetched from
 zhihuidu-amd/hipgraph-ms), `sort_check.py` (segmented sort correctness), `flex_check.py`
-(cloth physics vs CPU reference).
+(cloth physics vs CPU reference); and from the robustness pass: **`block_dropout.py`**
+(the reproducer for the MI350X dropped-workgroup corruption), `big_launch.py`
+(oversized launches past HSA's uint32 ceiling), `null_stream_sync.py` (torn `.numpy()`
+reads), `capture_fork_join.py` (captured cross-stream join ordering), `copy_repro.py`
+(the exact intermittent async-copy configuration), `flake_hunt.py` (repeat one test with
+optional background GPU load).
 
 ## Upstream relationships
 

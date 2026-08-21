@@ -1371,7 +1371,13 @@ def test_cuda_graph_topo_alloc_free_serializes_dependent_streams_only(test, devi
         assert _nodes_independent(node7, node8)
 
 
-# HIP/ROCm does not support native CUDA graph capture; exclude HIP devices.
+# HIP/ROCm supports native graph capture, but this suite is still excluded there:
+# test_cuda_graph_alloc_transient_stream faults the GPU on MI350X / ROCm 7.2
+# ("Memory access fault by GPU node-2 ... Reason: Unknown"), which aborts the whole
+# test process and takes every other test in the file with it. The test allocates
+# inside a capture on a temporary side stream and frees one array inside the capture;
+# a mis-ordered in-capture free releases memory that is still in use. Re-enable once
+# that is fixed -- see ROCM_HANDOFF.md.
 devices = [d for d in get_test_devices() if not d.is_hip]
 devices_with_cuda_graph_module_load = [d for d in get_test_devices_with_cuda_graph_module_load() if not d.is_hip]
 devices_with_graph_capture_allocation_and_cuda_graph_module_load = (

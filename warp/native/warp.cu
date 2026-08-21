@@ -1104,9 +1104,54 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
             // hipGraphAddMemAllocNode on explicitly constructed graphs.
             // Use hipFreeAsync on the capturing stream instead, the stream capture
             // mechanism records it as a proper free node in the graph.
+            //
+            // On its own that records a free node depending only on the capture
+            // stream's current frontier. The CUDA path below instead names every leaf
+            // node descended from the alloc node as a dependency, so the free is ordered
+            // after *all* uses of the allocation on *any* stream in the capture. Without
+            // that, an allocation used on a side stream (a wp.ScopedStream block inside a
+            // capture, which does not join back on exit) has no edge from its kernels to
+            // the free node, and replay unmaps the memory while they are still reading it
+            // -- a GPU memory access fault, seen on MI350X in
+            // test_cuda_graph_alloc_transient_stream. Add those leaves to the capture
+            // stream's dependency set before issuing the free so the recorded free node
+            // carries the same ordering.
             {
                 CaptureInfo* capture = capture_iter->second;
+                std::vector<cudaGraphNode_t> alloc_leaf_nodes;
+                if (alloc_info.node && get_dependent_leaf_nodes(alloc_info.node, alloc_leaf_nodes)
+                    && !alloc_leaf_nodes.empty()) {
+                    // Add, not set: the capture stream's own frontier must stay a
+                    // dependency so its ordering is preserved.
+                    check_cu(cuStreamUpdateCaptureDependencies_f(
+                        capture->stream, alloc_leaf_nodes.data(), alloc_leaf_nodes.size(),
+                        CU_STREAM_ADD_CAPTURE_DEPENDENCIES
+                    ));
+                } else if (!alloc_info.node) {
+                    fprintf(
+                        stderr,
+                        "Warp warning: %s: no allocation node for an in-capture free; the free may not "
+                        "be ordered after uses of the allocation on other streams\n",
+                        __FUNCTION__
+                    );
+                }
                 check_cuda(cudaFreeAsync(ptr, capture->stream));
+
+                // Report the recorded free node. Capture makes it the capture stream's
+                // sole frontier, so read it back from there -- the CUDA path below gets
+                // the handle directly from cudaGraphAddMemFreeNode, and the graph
+                // topology tests need it on both backends.
+                if (dbg_node_ret) {
+                    CUstreamCaptureStatus post_status = CU_STREAM_CAPTURE_STATUS_NONE;
+                    const cudaGraphNode_t* post_deps = NULL;
+                    size_t post_dep_count = 0;
+                    if (check_cu(cuStreamGetCaptureInfo_f(
+                            capture->stream, &post_status, NULL, NULL, &post_deps, &post_dep_count
+                        ))
+                        && post_status == CU_STREAM_CAPTURE_STATUS_ACTIVE && post_dep_count == 1) {
+                        *dbg_node_ret = post_deps[0];
+                    }
+                }
             }
 #else
             CaptureInfo* capture = capture_iter->second;
@@ -6173,13 +6218,30 @@ size_t wp_cuda_launch_kernel(
     // subsequent launch). Validate the request against the device LDS budget up front so an
     // over-budget launch fails cleanly with CUDA_ERROR_INVALID_VALUE, matching CUDA's synchronous
     // rejection, instead of corrupting the context.
-    // HIP/HSA linearizes the dispatch global work size into a uint32, so a launch whose total
-    // thread count exceeds UINT32_MAX is dispatched and faults with a sticky launch failure that
-    // poisons the context (and cascades to every subsequent launch). The CUDA driver has no such
-    // 32-bit ceiling; reject the over-sized launch up front so it fails cleanly instead.
-    if (dim > 0xFFFFFFFFull) {
-        check_cu(CUDA_ERROR_INVALID_VALUE);
-        return CUDA_ERROR_INVALID_VALUE;
+    // HIP/HSA encodes each dispatch dimension's global work size as a uint32, so
+    // gridDim.x * blockDim.x must stay within UINT32_MAX. An over-sized dispatch is not
+    // rejected by HIP: it faults with a sticky launch failure that poisons the context
+    // (and cascades to every subsequent launch). The CUDA driver has no such 32-bit ceiling.
+    //
+    // A grid-stride kernel loops over the full extent, so the grid size carries no semantics
+    // and shrinking it covers exactly the same work items -- clamp instead of failing. This
+    // is what lets grids beyond 2**32 threads (e.g. mujoco_warp's per-world nv x nv solver
+    // launches at high world counts) run on HIP at all. A lean kernel maps one thread per
+    // work item and is already spread across a 3D grid above, so it cannot exceed the
+    // per-dimension ceiling; reject anything that somehow still does.
+    {
+        const unsigned int max_grid_x_hsa = (unsigned int)(0xFFFFFFFFull / (unsigned long long)block_dim);
+        if (grid_x > max_grid_x_hsa) {
+            if (!grid_stride) {
+                check_cu(CUDA_ERROR_INVALID_VALUE);
+                return CUDA_ERROR_INVALID_VALUE;
+            }
+            grid_x = max_grid_x_hsa;
+            if (cluster_dim > 1)
+                grid_x = (grid_x / (unsigned int)cluster_dim) * (unsigned int)cluster_dim;
+            if (grid_x == 0)
+                grid_x = 1;
+        }
     }
 
     if (dim > 0) {
